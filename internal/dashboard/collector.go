@@ -22,6 +22,8 @@ const (
 	maxEnrichmentTime    = 12 * time.Second
 )
 
+var processProbeSlots = make(chan struct{}, 2*maxConcurrentWorkers)
+
 type Collector struct {
 	FleetRoot    string
 	StaleAfter   time.Duration
@@ -138,7 +140,13 @@ func (c Collector) enrichWorkers(ctx context.Context, workers []Worker) {
 	if probeTimeout <= maxEnrichmentTime/maxEnrichmentBatches {
 		enrichmentTime = maxEnrichmentBatches * probeTimeout
 	}
-	batchCount := (len(workers) + maxConcurrentWorkers - 1) / maxConcurrentWorkers
+	enrichableWorkers := 0
+	for index := range workers {
+		if workers[index].Worktree != "" {
+			enrichableWorkers++
+		}
+	}
+	batchCount := (enrichableWorkers + maxConcurrentWorkers - 1) / maxConcurrentWorkers
 	if batchCount > 0 {
 		probeTimeout = min(probeTimeout, enrichmentTime/time.Duration(batchCount))
 	}
@@ -198,7 +206,7 @@ func (c Collector) enrichWorker(parent context.Context, worker *Worker) {
 		result := PullRequest{Checks: []Check{}}
 		githubCtx, cancelGitHub := context.WithTimeout(parent, timeout)
 		defer cancelGitHub()
-		output, err := run(githubCtx, worker.Worktree, "gh", "pr", "view", "--json", "url,state,statusCheckRollup")
+		output, err := runLimitedProbe(githubCtx, run, worker.Worktree, "gh", "pr", "view", "--json", "url,state,statusCheckRollup")
 		if err == nil && len(output) <= 1<<20 {
 			var response struct {
 				URL               string  `json:"url"`
@@ -219,7 +227,7 @@ func (c Collector) enrichWorker(parent context.Context, worker *Worker) {
 		result := ToolStatus{}
 		noMistakesCtx, cancelNoMistakes := context.WithTimeout(parent, timeout)
 		defer cancelNoMistakes()
-		output, err := run(noMistakesCtx, worker.Worktree, "no-mistakes", "runs", "--limit", "1")
+		output, err := runLimitedProbe(noMistakesCtx, run, worker.Worktree, "no-mistakes", "runs", "--limit", "1")
 		if err == nil {
 			result = ToolStatus{Available: true, Phase: noMistakesPhase(output)}
 		}
@@ -227,6 +235,16 @@ func (c Collector) enrichWorker(parent context.Context, worker *Worker) {
 	}()
 	worker.PullRequest = <-pullRequest
 	worker.NoMistakes = <-noMistakes
+}
+
+func runLimitedProbe(ctx context.Context, run Runner, dir, name string, args ...string) ([]byte, error) {
+	select {
+	case processProbeSlots <- struct{}{}:
+		defer func() { <-processProbeSlots }()
+		return run(ctx, dir, name, args...)
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
 }
 
 func noMistakesPhase(output []byte) string {
@@ -275,6 +293,7 @@ func collectWorker(dir, task, project string, now time.Time, staleAfter time.Dur
 	}
 	if worker.Worktree != "" {
 		if info, statErr := os.Stat(worker.Worktree); statErr != nil || !info.IsDir() {
+			worker.Worktree = ""
 			return worker, warnings
 		}
 	}

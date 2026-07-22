@@ -17,7 +17,9 @@ The server always binds to `127.0.0.1:8992`. Open <http://127.0.0.1:8992/sergean
 
 The fleet root defaults to `$XDG_DATA_HOME/sergeant/fleet`, or `$HOME/.local/share/sergeant/fleet` when `XDG_DATA_HOME` is unset. `SERGEANT_FLEET_ROOT` can select a different read-only source, and `SERGEANT_STALE_AFTER` controls the default `30m` stale threshold.
 
-## User service
+## Linux user service
+
+The systemd lifecycle scripts support Linux only.
 
 Install and start the restart-on-failure systemd user service:
 
@@ -27,6 +29,17 @@ systemctl --user status sergeant-dashboard.service
 ```
 
 Remove it with `./scripts/uninstall.sh`. The service unit uses a read-only home and system filesystem, private temporary storage, and no new privileges.
+
+## macOS operation
+
+macOS does not include launchd integration. Build and run the binary directly from a terminal:
+
+```sh
+go build -o sergeant-dashboard ./cmd/sergeant-dashboard
+./sergeant-dashboard
+```
+
+Stop it with Control-C. Remove the local `sergeant-dashboard` binary to uninstall it. The Linux `scripts/install.sh` and `scripts/uninstall.sh` lifecycle scripts are not supported on macOS.
 
 ## Tailscale Serve
 
@@ -49,7 +62,7 @@ Set `SERGEANT_TAILNET_URL` to validate a different tailnet hostname. It must be 
 
 ## Rollback
 
-Remove only the dashboard Serve route, then stop and remove the user service:
+Remove only the dashboard Serve route, then stop and remove the Linux user service:
 
 ```sh
 tailscale serve --https=443 --set-path=/sergeant off
@@ -58,6 +71,8 @@ tailscale serve --https=443 --set-path=/sergeant off
 
 Verify rollback with `tailscale serve status` and `systemctl --user status sergeant-dashboard.service`. Do not use `tailscale serve reset`, because it also removes unrelated routes on the node.
 If the service cannot be stopped, uninstall exits without removing the unit or binary so the installation can be recovered and retried.
+
+On macOS, stop the foreground process with Control-C and remove the binary. If Tailscale Serve was configured, remove only the dashboard route with the same `tailscale serve --https=443 --set-path=/sergeant off` command.
 
 ## Development
 

@@ -5,11 +5,15 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -61,6 +65,66 @@ func TestHandlerIsReadOnly(t *testing.T) {
 		if response.Code != http.StatusMethodNotAllowed {
 			t.Errorf("POST %s = %d, want 405", path, response.Code)
 		}
+	}
+}
+
+func TestStateAPIBoundsProbeConcurrencyAcrossRequests(t *testing.T) {
+	root := t.TempDir()
+	for index := 0; index < 8; index++ {
+		worker := filepath.Join(root, fmt.Sprintf("task-%02d", index), "api")
+		worktree := filepath.Join(root, fmt.Sprintf("worktree-%02d", index))
+		mustMkdirAll(t, worker)
+		mustMkdirAll(t, worktree)
+		writeFile(t, filepath.Join(worker, "status"), "in_progress\n")
+		writeFile(t, filepath.Join(worker, "worktree"), worktree+"\n")
+	}
+
+	var active atomic.Int32
+	var maximum atomic.Int32
+	ready := make(chan struct{})
+	release := make(chan struct{})
+	var once sync.Once
+	runner := func(ctx context.Context, _ string, _ string, _ ...string) ([]byte, error) {
+		now := active.Add(1)
+		defer active.Add(-1)
+		for {
+			old := maximum.Load()
+			if now <= old || maximum.CompareAndSwap(old, now) {
+				break
+			}
+		}
+		if now == 16 {
+			once.Do(func() { close(ready) })
+		}
+		select {
+		case <-release:
+			return []byte(`{}`), nil
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+
+	handler := dashboard.NewHandler(dashboard.Collector{FleetRoot: root, Run: runner, ProbeTimeout: time.Second})
+	var requests sync.WaitGroup
+	requests.Add(2)
+	for range 2 {
+		go func() {
+			defer requests.Done()
+			request(t, handler, http.MethodGet, "/sergeant/api/state")
+		}()
+	}
+	select {
+	case <-ready:
+	case <-time.After(time.Second):
+		close(release)
+		t.Fatal("concurrent requests did not start 16 probes")
+	}
+	time.Sleep(25 * time.Millisecond)
+	close(release)
+	requests.Wait()
+
+	if got := maximum.Load(); got > 16 {
+		t.Fatalf("maximum active probes across requests = %d, want at most 16", got)
 	}
 }
 

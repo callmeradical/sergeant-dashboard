@@ -122,6 +122,58 @@ func TestCollectorBoundsDegradedFleetLatency(t *testing.T) {
 	}
 }
 
+func TestCollectorAllocatesProbeTimeoutOnlyAcrossEnrichableWorkers(t *testing.T) {
+	root := t.TempDir()
+	const invalidWorkerCount = 40
+	for index := 0; index < invalidWorkerCount; index++ {
+		worker := filepath.Join(root, fmt.Sprintf("invalid-%02d", index), "api")
+		mustMkdirAll(t, worker)
+		writeFile(t, filepath.Join(worker, "status"), "in_progress\n")
+		writeFile(t, filepath.Join(worker, "worktree"), filepath.Join(root, fmt.Sprintf("missing-%02d", index))+"\n")
+	}
+	healthyWorker := filepath.Join(root, "healthy", "api")
+	healthyWorktree := filepath.Join(root, "healthy-worktree")
+	mustMkdirAll(t, healthyWorker)
+	mustMkdirAll(t, healthyWorktree)
+	writeFile(t, filepath.Join(healthyWorker, "status"), "in_progress\n")
+	writeFile(t, filepath.Join(healthyWorker, "worktree"), healthyWorktree+"\n")
+
+	var invalidProbes atomic.Int32
+	runner := func(ctx context.Context, dir, name string, _ ...string) ([]byte, error) {
+		if dir != healthyWorktree {
+			invalidProbes.Add(1)
+			return nil, fmt.Errorf("unexpected probe for invalid worktree %q", dir)
+		}
+		select {
+		case <-time.After(160 * time.Millisecond):
+			if name == "no-mistakes" {
+				return []byte("review"), nil
+			}
+			return []byte(`{"url":"https://github.com/acme/api/pull/7","state":"OPEN"}`), nil
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+
+	state := dashboard.Collector{FleetRoot: root, Run: runner, ProbeTimeout: 200 * time.Millisecond}.Collect(t.Context())
+	if len(state.Workers) != invalidWorkerCount+1 {
+		t.Fatalf("workers = %d, want complete %d-worker projection", len(state.Workers), invalidWorkerCount+1)
+	}
+	var healthy dashboard.Worker
+	for _, worker := range state.Workers {
+		if worker.Task == "healthy" {
+			healthy = worker
+			break
+		}
+	}
+	if healthy.PullRequest.URL == "" || !healthy.NoMistakes.Available {
+		t.Fatalf("healthy worker metadata incomplete: pull request=%#v no-mistakes=%#v", healthy.PullRequest, healthy.NoMistakes)
+	}
+	if got := invalidProbes.Load(); got != 0 {
+		t.Fatalf("probes for non-enrichable workers = %d, want 0", got)
+	}
+}
+
 func TestCollectorBoundsGoroutinesIndependentlyOfFleetSize(t *testing.T) {
 	root := t.TempDir()
 	for index := 0; index < 512; index++ {

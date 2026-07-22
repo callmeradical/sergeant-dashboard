@@ -195,6 +195,39 @@ func TestDocumentationCoversServeValidationAndRollback(t *testing.T) {
 	}
 }
 
+func TestDocumentationDefinesLinuxAndMacOSServiceManagement(t *testing.T) {
+	readme, err := os.ReadFile("README.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, required := range []string{
+		"systemd lifecycle scripts support Linux only",
+		"macOS does not include launchd integration",
+		"go build -o sergeant-dashboard ./cmd/sergeant-dashboard",
+		"./sergeant-dashboard",
+		"Control-C",
+	} {
+		if !strings.Contains(string(readme), required) {
+			t.Errorf("README lacks %q", required)
+		}
+	}
+}
+
+func TestLifecycleScriptsRejectNonLinuxHosts(t *testing.T) {
+	mocks := filepath.Join(t.TempDir(), "bin")
+	mustMkdir(t, mocks)
+	writeExecutable(t, filepath.Join(mocks, "uname"), "#!/bin/sh\nprintf '%s\\n' Darwin\n")
+	env := append(os.Environ(), "PATH="+mocks+":/usr/bin:/bin")
+	for _, script := range []string{"scripts/install.sh", "scripts/uninstall.sh"} {
+		command := exec.Command("sh", script)
+		command.Env = env
+		output, err := command.CombinedOutput()
+		if err == nil || !strings.Contains(string(output), "supports Linux only") {
+			t.Errorf("%s on macOS: err=%v output=%q", script, err, output)
+		}
+	}
+}
+
 func TestValidationRequiresServePathAndBackendAssociation(t *testing.T) {
 	home := t.TempDir()
 	binDir := filepath.Join(home, ".local", "bin")

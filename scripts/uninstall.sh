@@ -1,6 +1,11 @@
 #!/bin/sh
 set -eu
 
+if [ "$(uname -s)" != "Linux" ]; then
+	printf '%s\n' "sergeant-dashboard systemd uninstallation supports Linux only" >&2
+	exit 1
+fi
+
 bin_dir=${HOME}/.local/bin
 unit_dir=${XDG_CONFIG_HOME:-${HOME}/.config}/systemd/user
 
