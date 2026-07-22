@@ -57,6 +57,7 @@ tailscale serve --https=443 --set-path=/sergeant off
 ```
 
 Verify rollback with `tailscale serve status` and `systemctl --user status sergeant-dashboard.service`. Do not use `tailscale serve reset`, because it also removes unrelated routes on the node.
+If the service cannot be stopped, uninstall exits without removing the unit or binary so the installation can be recovered and retried.
 
 ## Development
 

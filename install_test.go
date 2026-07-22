@@ -15,6 +15,9 @@ func TestInstallAndUninstallManageUserService(t *testing.T) {
 	logPath := filepath.Join(t.TempDir(), "systemctl.log")
 	writeExecutable(t, filepath.Join(mocks, "systemctl"), `#!/bin/sh
 printf '%s\n' "$*" >> "$SYSTEMCTL_LOG"
+if [ "$*" = "--user is-active --quiet sergeant-dashboard.service" ]; then
+  exit 3
+fi
 `)
 	writeExecutable(t, filepath.Join(mocks, "go"), `#!/bin/sh
 while [ "$#" -gt 0 ]; do
@@ -64,10 +67,71 @@ exit 1
 	if err != nil {
 		t.Fatal(err)
 	}
-	wantLog := "--user daemon-reload\n--user enable --now sergeant-dashboard.service\n--user disable --now sergeant-dashboard.service\n--user daemon-reload\n"
+	wantLog := "--user daemon-reload\n--user enable --now sergeant-dashboard.service\n--user disable --now sergeant-dashboard.service\n--user is-active --quiet sergeant-dashboard.service\n--user daemon-reload\n"
 	if string(logData) != wantLog {
 		t.Fatalf("systemctl calls = %q, want %q", logData, wantLog)
 	}
+}
+
+func TestUninstallPreservesArtifactsWhenServiceCannotStop(t *testing.T) {
+	home := t.TempDir()
+	mocks := filepath.Join(t.TempDir(), "bin")
+	mustMkdir(t, mocks)
+	writeExecutable(t, filepath.Join(mocks, "systemctl"), `#!/bin/sh
+case "$*" in
+  "--user disable --now sergeant-dashboard.service") exit 1 ;;
+  "--user is-active --quiet sergeant-dashboard.service") exit 0 ;;
+esac
+exit 0
+`)
+
+	binary := filepath.Join(home, ".local", "bin", "sergeant-dashboard")
+	unit := filepath.Join(home, "config", "systemd", "user", "sergeant-dashboard.service")
+	mustMkdir(t, filepath.Dir(binary))
+	mustMkdir(t, filepath.Dir(unit))
+	writeExecutable(t, binary, "#!/bin/sh\n")
+	if err := os.WriteFile(unit, []byte("[Service]\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	command := exec.Command("sh", "scripts/uninstall.sh")
+	command.Env = append(os.Environ(),
+		"HOME="+home,
+		"XDG_CONFIG_HOME="+filepath.Join(home, "config"),
+		"PATH="+mocks+":/usr/bin:/bin",
+	)
+	output, err := command.CombinedOutput()
+	if err == nil {
+		t.Fatalf("uninstall succeeded while service remained active: %s", output)
+	}
+	if strings.Contains(string(output), "Uninstalled") {
+		t.Fatalf("failed uninstall printed success: %s", output)
+	}
+	for _, path := range []string{binary, unit} {
+		if _, statErr := os.Stat(path); statErr != nil {
+			t.Errorf("failed uninstall removed recovery artifact %s: %v", path, statErr)
+		}
+	}
+}
+
+func TestUninstallToleratesMissingInactiveService(t *testing.T) {
+	home := t.TempDir()
+	mocks := filepath.Join(t.TempDir(), "bin")
+	mustMkdir(t, mocks)
+	writeExecutable(t, filepath.Join(mocks, "systemctl"), `#!/bin/sh
+case "$*" in
+  "--user disable --now sergeant-dashboard.service") exit 1 ;;
+  "--user is-active --quiet sergeant-dashboard.service") exit 3 ;;
+esac
+exit 0
+`)
+	env := append(os.Environ(),
+		"HOME="+home,
+		"XDG_CONFIG_HOME="+filepath.Join(home, "config"),
+		"PATH="+mocks+":/usr/bin:/bin",
+	)
+
+	runScript(t, env, "scripts/uninstall.sh")
 }
 
 func TestDocumentationCoversServeValidationAndRollback(t *testing.T) {
@@ -82,6 +146,7 @@ func TestDocumentationCoversServeValidationAndRollback(t *testing.T) {
 		"## Rollback",
 		"tailscale serve --https=443 --set-path=/sergeant off",
 		"./scripts/uninstall.sh",
+		"If the service cannot be stopped, uninstall exits without removing the unit or binary",
 	} {
 		if !strings.Contains(string(readme), required) {
 			t.Errorf("README lacks %q", required)
