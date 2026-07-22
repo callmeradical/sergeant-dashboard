@@ -23,8 +23,10 @@ type Source interface {
 }
 
 type collectionCall struct {
-	done  chan struct{}
-	state State
+	done    chan struct{}
+	state   State
+	cancel  context.CancelFunc
+	waiters int
 }
 
 type coalescingSource struct {
@@ -65,26 +67,43 @@ func NewHandler(source Source) http.Handler {
 
 func (source *coalescingSource) Collect(ctx context.Context) State {
 	source.mu.Lock()
-	if source.active != nil {
-		active := source.active
-		source.mu.Unlock()
-		select {
-		case <-active.done:
-			return active.state
-		case <-ctx.Done():
-			return State{Workers: []Worker{}, Warnings: []string{}}
-		}
+	active := source.active
+	if active == nil {
+		collectionCtx, cancel := context.WithTimeout(context.Background(), maxEnrichmentTime)
+		active = &collectionCall{done: make(chan struct{}), cancel: cancel}
+		source.active = active
+		go source.collect(active, collectionCtx)
 	}
-	active := &collectionCall{done: make(chan struct{})}
-	source.active = active
+	active.waiters++
 	source.mu.Unlock()
 
-	active.state = source.source.Collect(ctx)
+	select {
+	case <-active.done:
+		return active.state
+	case <-ctx.Done():
+		source.mu.Lock()
+		if source.active == active {
+			active.waiters--
+			if active.waiters == 0 {
+				source.active = nil
+				active.cancel()
+			}
+		}
+		source.mu.Unlock()
+		return State{Workers: []Worker{}, Warnings: []string{}}
+	}
+}
+
+func (source *coalescingSource) collect(active *collectionCall, ctx context.Context) {
+	state := source.source.Collect(ctx)
+	active.cancel()
 	source.mu.Lock()
-	source.active = nil
+	active.state = state
+	if source.active == active {
+		source.active = nil
+	}
 	close(active.done)
 	source.mu.Unlock()
-	return active.state
 }
 
 func getOnly(next http.HandlerFunc) http.HandlerFunc {

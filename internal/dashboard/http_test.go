@@ -25,6 +25,10 @@ type fixedSource struct{ state dashboard.State }
 
 func (source fixedSource) Collect(context.Context) dashboard.State { return source.state }
 
+type sourceFunc func(context.Context) dashboard.State
+
+func (collect sourceFunc) Collect(ctx context.Context) dashboard.State { return collect(ctx) }
+
 func TestHandlerServesHealthStateAndEmbeddedApplication(t *testing.T) {
 	state := dashboard.State{
 		CollectedAt: time.Date(2026, 7, 21, 12, 0, 0, 0, time.UTC),
@@ -132,6 +136,81 @@ func TestStateAPIBoundsProbeConcurrencyAcrossRequests(t *testing.T) {
 			t.Errorf("complete no-mistakes projections = %d, want 8: %s", got, body)
 		}
 	}
+}
+
+func TestStateAPILeaderCancellationDoesNotCancelSurvivingRequest(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var once sync.Once
+	var calls atomic.Int32
+	source := sourceFunc(func(ctx context.Context) dashboard.State {
+		calls.Add(1)
+		once.Do(func() { close(started) })
+		select {
+		case <-release:
+			return dashboard.State{Workers: []dashboard.Worker{{
+				Task: "task", Project: "api", Health: "active",
+				PullRequest: dashboard.PullRequest{URL: "https://github.com/acme/api/pull/7", Checks: []dashboard.Check{}},
+			}}, Warnings: []string{}}
+		case <-ctx.Done():
+			return dashboard.State{Workers: []dashboard.Worker{}, Warnings: []string{}}
+		}
+	})
+	handler := dashboard.NewHandler(source)
+
+	leaderCtx, cancelLeader := context.WithCancel(t.Context())
+	leaderDone := make(chan struct{})
+	go func() {
+		defer close(leaderDone)
+		request := httptest.NewRequest(http.MethodGet, "/sergeant/api/state", nil).WithContext(leaderCtx)
+		handler.ServeHTTP(httptest.NewRecorder(), request)
+	}()
+	<-started
+
+	followerDone := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		followerDone <- request(t, handler, http.MethodGet, "/sergeant/api/state")
+	}()
+	time.Sleep(25 * time.Millisecond)
+	cancelLeader()
+	time.Sleep(25 * time.Millisecond)
+	close(release)
+
+	follower := <-followerDone
+	<-leaderDone
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("collections = %d, want one shared collection", got)
+	}
+	if !strings.Contains(follower.Body.String(), `"url":"https://github.com/acme/api/pull/7"`) {
+		t.Fatalf("surviving request received incomplete shared state: %s", follower.Body.String())
+	}
+}
+
+func TestStateAPICancelsSharedCollectionAfterAllRequestsCancel(t *testing.T) {
+	started := make(chan struct{})
+	canceled := make(chan struct{})
+	source := sourceFunc(func(ctx context.Context) dashboard.State {
+		close(started)
+		<-ctx.Done()
+		close(canceled)
+		return dashboard.State{Workers: []dashboard.Worker{}, Warnings: []string{}}
+	})
+	handler := dashboard.NewHandler(source)
+	requestCtx, cancelRequest := context.WithCancel(t.Context())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		request := httptest.NewRequest(http.MethodGet, "/sergeant/api/state", nil).WithContext(requestCtx)
+		handler.ServeHTTP(httptest.NewRecorder(), request)
+	}()
+	<-started
+	cancelRequest()
+	select {
+	case <-canceled:
+	case <-time.After(time.Second):
+		t.Fatal("shared collection continued after every request canceled")
+	}
+	<-done
 }
 
 func TestStateAPIProjectsOnlyAllowlistedMetadata(t *testing.T) {
