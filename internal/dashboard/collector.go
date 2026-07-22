@@ -70,7 +70,7 @@ type Check struct {
 
 type ToolStatus struct {
 	Available bool   `json:"available"`
-	Summary   string `json:"summary,omitempty"`
+	Phase     string `json:"phase,omitempty"`
 }
 
 type AuditMetadata struct {
@@ -146,7 +146,7 @@ func (c Collector) enrichWorker(parent context.Context, worker *Worker) {
 	if worker.Worktree == "" {
 		return
 	}
-	worker.Graphify = fileMetadata(filepath.Join(worker.Worktree, "graphify-out", "GRAPH_REPORT.md"))
+	worker.Graphify = graphifyMetadata(worker.Worktree)
 	pending := fileMetadata(filepath.Join(filepath.Dir(worker.Worktree), "response_id"))
 	// Current Sergeant workers keep transport metadata beside their scalar state,
 	// not necessarily in the worktree.
@@ -164,9 +164,10 @@ func (c Collector) enrichWorker(parent context.Context, worker *Worker) {
 	if timeout <= 0 {
 		timeout = 3 * time.Second
 	}
-	ctx, cancel := context.WithTimeout(parent, timeout)
-	defer cancel()
-	if output, err := run(ctx, worker.Worktree, "gh", "pr", "view", "--json", "url,state,statusCheckRollup"); err == nil && len(output) <= 1<<20 {
+	githubCtx, cancelGitHub := context.WithTimeout(parent, timeout)
+	output, err := run(githubCtx, worker.Worktree, "gh", "pr", "view", "--json", "url,state,statusCheckRollup")
+	cancelGitHub()
+	if err == nil && len(output) <= 1<<20 {
 		var response struct {
 			URL               string  `json:"url"`
 			State             string  `json:"state"`
@@ -179,12 +180,28 @@ func (c Collector) enrichWorker(parent context.Context, worker *Worker) {
 			worker.PullRequest = PullRequest{URL: response.URL, State: response.State, Checks: response.StatusCheckRollup}
 		}
 	}
-	if output, err := run(ctx, worker.Worktree, "no-mistakes", "runs", "--limit", "1"); err == nil && len(output) <= maxScalarBytes {
-		summary := strings.Join(strings.Fields(string(output)), " ")
-		if summary != "" {
-			worker.NoMistakes = ToolStatus{Available: true, Summary: redactString(summary)}
+	noMistakesCtx, cancelNoMistakes := context.WithTimeout(parent, timeout)
+	noMistakesOutput, err := run(noMistakesCtx, worker.Worktree, "no-mistakes", "runs", "--limit", "1")
+	cancelNoMistakes()
+	if err == nil {
+		worker.NoMistakes = ToolStatus{Available: true, Phase: noMistakesPhase(noMistakesOutput)}
+	}
+}
+
+func noMistakesPhase(output []byte) string {
+	if len(output) > maxScalarBytes {
+		return ""
+	}
+	fields := strings.FieldsFunc(strings.ToLower(string(output)), func(character rune) bool {
+		return character < 'a' || character > 'z'
+	})
+	for _, field := range fields {
+		switch field {
+		case "intent", "rebase", "review", "test", "document", "lint", "push", "pr", "ci":
+			return field
 		}
 	}
+	return ""
 }
 
 func runCommand(ctx context.Context, dir, name string, args ...string) ([]byte, error) {
@@ -205,7 +222,7 @@ func collectWorker(dir, task, project string, now time.Time, staleAfter time.Dur
 	worker.Branch, _, _ = readScalarWithTime(filepath.Join(dir, "branch"))
 	worker.TDTask, _, _ = readScalarWithTime(filepath.Join(dir, "td_task"))
 	worker.Worktree, _, _ = readScalarWithTime(filepath.Join(dir, "worktree"))
-	worker.Message = messageMetadata(filepath.Join(dir, "message"))
+	worker.Message = fileMetadata(filepath.Join(dir, "message"))
 
 	if worker.Status == "orphaned" {
 		return worker, warnings
@@ -250,16 +267,16 @@ func fileMetadata(path string) FileMetadata {
 	return FileMetadata{Present: true, UpdatedAt: info.ModTime().UTC()}
 }
 
-func messageMetadata(path string) FileMetadata {
-	value, updatedAt, err := readScalarWithTime(path)
-	if err != nil {
-		return fileMetadata(path)
+func graphifyMetadata(worktree string) FileMetadata {
+	report := fileMetadata(filepath.Join(worktree, "graphify-out", "GRAPH_REPORT.md"))
+	pending := fileMetadata(filepath.Join(worktree, "graphify-out", ".needs_update"))
+	if pending.Present {
+		return FileMetadata{Present: true, UpdatedAt: latestTime(report.UpdatedAt, pending.UpdatedAt), Summary: "update pending"}
 	}
-	return FileMetadata{
-		Present:   true,
-		UpdatedAt: updatedAt,
-		Summary:   redactString(strings.Join(strings.Fields(value), " ")),
+	if report.Present {
+		report.Summary = "ready"
 	}
+	return report
 }
 
 func isTerminal(status string) bool {

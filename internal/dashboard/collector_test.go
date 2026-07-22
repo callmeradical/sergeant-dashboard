@@ -53,6 +53,32 @@ func TestCollectorProbesWorkersConcurrently(t *testing.T) {
 	}
 }
 
+func TestCollectorUsesAnIndependentTimeoutForEachProbe(t *testing.T) {
+	root := t.TempDir()
+	worker := filepath.Join(root, "task-a", "api")
+	worktree := filepath.Join(root, "worktree")
+	mustMkdirAll(t, worker)
+	mustMkdirAll(t, worktree)
+	writeFile(t, filepath.Join(worker, "status"), "in_progress\n")
+	writeFile(t, filepath.Join(worker, "worktree"), worktree+"\n")
+
+	runner := func(ctx context.Context, _ string, name string, _ ...string) ([]byte, error) {
+		if name == "gh" {
+			<-ctx.Done()
+			return nil, ctx.Err()
+		}
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		return []byte("run detected"), nil
+	}
+
+	state := dashboard.Collector{FleetRoot: root, Run: runner, ProbeTimeout: time.Millisecond}.Collect(t.Context())
+	if !state.Workers[0].NoMistakes.Available {
+		t.Fatal("a timed-out GitHub probe exhausted the no-mistakes probe timeout")
+	}
+}
+
 func TestCollectorEnrichesWorkerWithReadOnlyDeliveryMetadata(t *testing.T) {
 	root := t.TempDir()
 	worker := filepath.Join(root, "task-123", "api")
@@ -63,6 +89,7 @@ func TestCollectorEnrichesWorkerWithReadOnlyDeliveryMetadata(t *testing.T) {
 	writeFile(t, filepath.Join(worker, "worktree"), worktree+"\n")
 	writeFile(t, filepath.Join(worker, "response_id"), "opaque-secret-id\n")
 	writeFile(t, filepath.Join(worktree, "graphify-out", "GRAPH_REPORT.md"), "# report\n")
+	writeFile(t, filepath.Join(worktree, "graphify-out", ".needs_update"), "")
 
 	runner := func(_ context.Context, dir, name string, args ...string) ([]byte, error) {
 		if dir != worktree {
@@ -72,7 +99,7 @@ func TestCollectorEnrichesWorkerWithReadOnlyDeliveryMetadata(t *testing.T) {
 		case "gh":
 			return []byte(`{"url":"https://github.com/acme/api/pull/7","state":"OPEN","statusCheckRollup":[{"name":"test","status":"COMPLETED","conclusion":"SUCCESS"}]}`), nil
 		case "no-mistakes":
-			return []byte("run 42  review  running\n"), nil
+			return []byte("run 42 review running token=unrecognized-secret\n"), nil
 		default:
 			t.Fatalf("unexpected probe: %s %v", name, args)
 			return nil, nil
@@ -84,14 +111,15 @@ func TestCollectorEnrichesWorkerWithReadOnlyDeliveryMetadata(t *testing.T) {
 	if got.PullRequest.URL != "https://github.com/acme/api/pull/7" || got.PullRequest.Checks[0].Conclusion != "SUCCESS" {
 		t.Fatalf("pull request = %#v", got.PullRequest)
 	}
-	if got.NoMistakes.Summary != "run 42 review running" {
+	if !got.NoMistakes.Available || got.NoMistakes.Phase != "review" {
 		t.Fatalf("no-mistakes = %#v", got.NoMistakes)
 	}
-	if !got.Graphify.Present || !got.OCInject.ResponsePending {
+	if !got.Graphify.Present || got.Graphify.Summary != "update pending" || !got.OCInject.ResponsePending {
 		t.Fatalf("graphify/oc-inject = %#v / %#v", got.Graphify, got.OCInject)
 	}
-	if strings.Contains(dashboard.MustJSON(state), "opaque-secret-id") {
-		t.Fatal("response ID value was exposed")
+	serialized := dashboard.MustJSON(state)
+	if strings.Contains(serialized, "opaque-secret-id") || strings.Contains(serialized, "unrecognized-secret") {
+		t.Fatal("opaque source data was exposed")
 	}
 }
 
@@ -145,11 +173,11 @@ func TestCollectorProjectsFleetWithoutReadingSensitiveBodies(t *testing.T) {
 	if !got.Message.Present || !got.Message.UpdatedAt.Equal(now.Add(-30*time.Second)) {
 		t.Fatalf("message metadata = %#v", got.Message)
 	}
-	if got.Message.Summary != "Approval required; password=[REDACTED]" {
-		t.Fatalf("message summary = %q", got.Message.Summary)
+	if got.Message.Summary != "" {
+		t.Fatalf("message body was projected: %q", got.Message.Summary)
 	}
 	serialized := dashboard.MustJSON(state)
-	if strings.Contains(serialized, "hunter2") || strings.Contains(serialized, "SECRET_PROMPT_BODY") {
+	if strings.Contains(serialized, "Approval required") || strings.Contains(serialized, "hunter2") || strings.Contains(serialized, "SECRET_PROMPT_BODY") {
 		t.Fatalf("state exposed a sensitive body: %s", serialized)
 	}
 }

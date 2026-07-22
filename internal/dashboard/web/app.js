@@ -49,12 +49,21 @@ function workerCard(worker) {
     link.textContent = worker.pullRequest.state || 'View PR';
     value.append(link); meta.append(value);
   }
-  card.append(meta);
-  if (worker.message?.summary) {
-    const message = text('p', worker.message?.summary, 'message');
-    message.setAttribute('aria-label', 'Worker message');
-    card.append(message);
+  if (worker.pullRequest?.checks?.length) {
+    const checks = worker.pullRequest.checks.map(check => `${check.name || 'check'}: ${check.conclusion || check.status || 'pending'}`);
+    meta.append(text('dt', 'Checks'), text('dd', checks.join(', ')));
   }
+  if (worker.message?.present) {
+    meta.append(text('dt', 'Message'), text('dd', worker.message.updatedAt ? `updated ${new Date(worker.message.updatedAt).toLocaleString()}` : 'present'));
+  }
+  if (worker.noMistakes?.available) {
+    meta.append(text('dt', 'no-mistakes'), text('dd', worker.noMistakes?.phase ? `${worker.noMistakes.phase} phase` : 'run detected'));
+  }
+  if (worker.graphify?.present) {
+    const updated = worker.graphify?.updatedAt ? `, ${new Date(worker.graphify.updatedAt).toLocaleString()}` : '';
+    meta.append(text('dt', 'Graphify'), text('dd', `${worker.graphify?.summary || 'available'}${updated}`));
+  }
+  card.append(meta);
   const signals = document.createElement('div');
   signals.className = 'signals';
   [['message', worker.message?.present], ['graphify', worker.graphify?.present], ['no-mistakes', worker.noMistakes?.available], ['oc-inject', worker.ocInject?.responsePending || worker.ocInject?.responseAcked]].forEach(([label, on]) => {

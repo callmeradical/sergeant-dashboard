@@ -49,6 +49,12 @@ func TestDocumentationPinsTailscaleSubpathAndHealthValidation(t *testing.T) {
 			t.Errorf("%s retains the conflicting listener", path)
 		}
 	}
+	validate := readProjectFile(t, "scripts/validate.sh")
+	for _, required := range []string{"tailscale serve status --json", "127.0.0.1:8992/sergeant", "'/sergeant'"} {
+		if !strings.Contains(validate, required) {
+			t.Errorf("validation script lacks Serve assertion %q", required)
+		}
+	}
 }
 
 func readProjectFile(t *testing.T, path string) string {

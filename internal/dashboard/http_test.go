@@ -49,8 +49,13 @@ func TestHandlerServesHealthStateAndEmbeddedApplication(t *testing.T) {
 		t.Fatal("application response lacks a content security policy")
 	}
 	script := request(t, handler, http.MethodGet, "/sergeant/app.js")
-	if !strings.Contains(script.Body.String(), "worker.message?.summary") {
-		t.Fatal("embedded application does not render operational messages")
+	if strings.Contains(script.Body.String(), "worker.message?.summary") {
+		t.Fatal("embedded application can render worker message bodies")
+	}
+	for _, required := range []string{"worker.message?.present", "worker.pullRequest?.checks", "worker.noMistakes?.available", "worker.noMistakes?.phase", "worker.graphify?.summary", "worker.graphify?.updatedAt"} {
+		if !strings.Contains(script.Body.String(), required) {
+			t.Errorf("embedded application lacks %q", required)
+		}
 	}
 }
 

@@ -2,7 +2,7 @@
 
 Read-only operational dashboard for Sergeant fleets, delivery gates, and project activity. The Go binary embeds its responsive frontend and projects source state without changing Sergeant, td, GitHub, no-mistakes, Graphify, oc-inject, repositories, or worker processes.
 
-The collector deliberately reads only whitelisted scalar metadata. Prompt bodies, injected message bodies, logs, tokens, environment values, secrets, and credentials are neither rendered nor persisted.
+The collector deliberately reads only whitelisted scalar metadata. Worker-message presence and timestamps are visible, but message contents, prompt bodies, injected message bodies, logs, command output, tokens, environment values, secrets, and credentials are neither rendered nor persisted.
 
 ## Build and run
 
