@@ -61,7 +61,7 @@ If the service cannot be stopped, uninstall exits without removing the unit or b
 
 ## Development
 
-The offline frontend behavior test requires Node.js 22 or newer; the application binary has no Node.js runtime dependency.
+The offline frontend behavior test requires Node.js 22 or newer and Chrome or Chromium; the application binary has no browser or Node.js runtime dependency.
 
 ```sh
 go test ./...

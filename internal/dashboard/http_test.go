@@ -163,9 +163,21 @@ func TestEmbeddedApplicationRendersBrowserBehavior(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	browser := os.Getenv("CHROME_BIN")
+	if browser == "" {
+		for _, candidate := range []string{"google-chrome", "chromium", "chromium-browser"} {
+			if path, lookErr := exec.LookPath(candidate); lookErr == nil {
+				browser = path
+				break
+			}
+		}
+	}
+	if browser == "" {
+		t.Fatal("Chrome or Chromium is required for frontend behavior tests")
+	}
 
 	command := exec.Command("node", "testdata/frontend_test.mjs")
-	command.Env = append(os.Environ(), "FRONTEND_FIXTURES="+base64.StdEncoding.EncodeToString(fixtureJSON))
+	command.Env = append(os.Environ(), "CHROME_BIN="+browser, "FRONTEND_FIXTURES="+base64.StdEncoding.EncodeToString(fixtureJSON))
 	if output, err := command.CombinedOutput(); err != nil {
 		t.Fatalf("frontend behavior: %v: %s", err, output)
 	}

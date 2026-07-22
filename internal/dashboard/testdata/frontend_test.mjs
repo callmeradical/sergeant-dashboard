@@ -6,7 +6,7 @@ import { spawn } from 'node:child_process';
 import { createServer } from 'node:net';
 import { request } from 'node:http';
 
-const browser = process.env.CHROME_BIN || '/usr/bin/google-chrome';
+const browser = process.env.CHROME_BIN;
 const fixtures = JSON.parse(Buffer.from(process.env.FRONTEND_FIXTURES, 'base64'));
 
 const delay = milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds));
