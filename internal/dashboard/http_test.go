@@ -3,9 +3,11 @@ package dashboard_test
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"os/exec"
 	"strings"
 	"testing"
@@ -116,7 +118,54 @@ func TestStateAPIProjectsBlockedLifecycleStatus(t *testing.T) {
 }
 
 func TestEmbeddedApplicationRendersBrowserBehavior(t *testing.T) {
+	state := dashboard.State{
+		CollectedAt: time.Date(2026, 7, 21, 12, 0, 0, 0, time.UTC),
+		Workers: []dashboard.Worker{
+			{
+				Task: "raw-private-task", Project: "raw-private-project", Status: "in_progress", Health: "active", Agent: "opencode",
+				Branch: "secret-branch", TDTask: "td-123", Worktree: "/secret/worktree",
+				Message: dashboard.FileMetadata{Present: true, Summary: "secret message body"},
+				PullRequest: dashboard.PullRequest{
+					URL: "https://github.com/acme/widget/pull/7?token=secret", State: "OPEN",
+					Checks: []dashboard.Check{{Name: "private check name", Conclusion: "SUCCESS"}},
+				},
+				NoMistakes: dashboard.ToolStatus{Available: true, Phase: "review"}, Graphify: dashboard.FileMetadata{Present: true, Summary: "ready"},
+				OCInject: dashboard.AuditMetadata{ResponsePending: true},
+			},
+			{Task: "stale-task", Project: "stale-project", Status: "blocked", Health: "stale", TDTask: "invalid task"},
+		},
+		Warnings: []string{"secret source warning"},
+	}
+	valid := dashboard.NewHandler(fixedSource{state: state})
+	empty := dashboard.NewHandler(fixedSource{state: dashboard.State{Workers: []dashboard.Worker{}, Warnings: []string{}}})
+	assets := dashboard.NewHandler(fixedSource{})
+	malformed := http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.URL.Path == "/sergeant/api/state" {
+			writer.Header().Set("Content-Type", "application/json")
+			_, _ = writer.Write([]byte(`{"workers":`))
+			return
+		}
+		assets.ServeHTTP(writer, request)
+	})
+	type browserResponse struct {
+		Status  int         `json:"status"`
+		Headers http.Header `json:"headers"`
+		Body    string      `json:"body"`
+	}
+	fixtures := make(map[string]browserResponse)
+	for prefix, handler := range map[string]http.Handler{"/valid": valid, "/empty": empty, "/malformed": malformed} {
+		for _, path := range []string{"/sergeant/", "/sergeant/app.css", "/sergeant/app.js", "/sergeant/api/state"} {
+			response := request(t, handler, http.MethodGet, path)
+			fixtures[prefix+path] = browserResponse{Status: response.Code, Headers: response.Header(), Body: base64.StdEncoding.EncodeToString(response.Body.Bytes())}
+		}
+	}
+	fixtureJSON, err := json.Marshal(fixtures)
+	if err != nil {
+		t.Fatal(err)
+	}
+
 	command := exec.Command("node", "testdata/frontend_test.mjs")
+	command.Env = append(os.Environ(), "FRONTEND_FIXTURES="+base64.StdEncoding.EncodeToString(fixtureJSON))
 	if output, err := command.CombinedOutput(); err != nil {
 		t.Fatalf("frontend behavior: %v: %s", err, output)
 	}
