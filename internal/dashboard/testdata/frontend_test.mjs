@@ -1,7 +1,8 @@
 import assert from 'node:assert/strict';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { pathToFileURL } from 'node:url';
 import { spawn } from 'node:child_process';
 import { createServer } from 'node:net';
 import { request } from 'node:http';
@@ -95,28 +96,28 @@ async function openPage(target, viewport) {
     const script = Buffer.from(fixtures[`${prefix}/sergeant/app.js`].body, 'base64').toString();
     const api = Buffer.from(fixtures[`${prefix}/sergeant/api/state`].body, 'base64').toString();
     const policy = fixtures[`${prefix}/sergeant/`].headers['Content-Security-Policy'][0];
-    const cspProbe = `<meta http-equiv="Content-Security-Policy" content="${policy.replaceAll('"', '&quot;')}"><script>window.inlineCSPProbe=true<\/script>`;
-    await command('Page.navigate', { url: `data:text/html,${encodeURIComponent(cspProbe)}` });
-    await delay(50);
-    const cspResult = await command('Runtime.evaluate', { expression: 'window.inlineCSPProbe === undefined', returnByValue: true });
-    assert.equal(cspResult.result.value, true, 'handler CSP allowed inline script execution');
-
-    await command('Page.navigate', { url: 'about:blank' });
-    const frameTree = await command('Page.getFrameTree');
-    await command('Page.setDocumentContent', { frameId: frameTree.frameTree.frame.id, html });
-    await command('Runtime.evaluate', { expression: `(() => { const style = document.createElement('style'); style.textContent = ${JSON.stringify(css)}; document.head.append(style); })()` });
+    const securedHTML = html
+      .replace('<head>', `<head><meta http-equiv="Content-Security-Policy" content="${policy.replaceAll('"', '&quot;')}"><script>window.inlineCSPProbe=true<\/script>`);
+    const fixtureDirectory = join(profile, 'fixtures', target);
+    await mkdir(fixtureDirectory, { recursive: true });
+    await Promise.all([
+      writeFile(join(fixtureDirectory, 'index.html'), securedHTML),
+      writeFile(join(fixtureDirectory, 'app.css'), css),
+      writeFile(join(fixtureDirectory, 'app.js'), script),
+    ]);
     const fetchSetup = target === 'malformed'
       ? `window.fetch = () => Promise.resolve({ ok: true, json: () => Promise.reject(new Error('malformed state')) })`
       : `window.fetch = () => Promise.resolve({ ok: true, json: () => Promise.resolve(${api}) })`;
-    await command('Runtime.evaluate', { expression: fetchSetup });
-    const scriptResult = await command('Runtime.evaluate', { expression: script });
-    if (scriptResult.exceptionDetails) throw new Error(scriptResult.exceptionDetails.text);
+    await command('Page.addScriptToEvaluateOnNewDocument', { source: fetchSetup });
+    await command('Page.navigate', { url: pathToFileURL(join(fixtureDirectory, 'index.html')).href });
     for (let attempt = 0; attempt < 100; attempt++) {
       const result = await command('Runtime.evaluate', { expression: `document.readyState === 'complete' && !document.querySelector('#workers')?.textContent.includes('Loading fleet state')`, returnByValue: true });
       if (result.result.value) break;
       await delay(50);
       if (attempt === 99) throw new Error(`page did not render: ${target}`);
     }
+    const cspResult = await command('Runtime.evaluate', { expression: 'window.inlineCSPProbe === undefined', returnByValue: true });
+    assert.equal(cspResult.result.value, true, 'handler CSP allowed inline script execution');
     const evaluate = async expression => {
       const result = await command('Runtime.evaluate', { expression, returnByValue: true, awaitPromise: true });
       if (result.exceptionDetails) throw new Error(result.exceptionDetails.text);
