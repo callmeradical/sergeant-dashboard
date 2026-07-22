@@ -17,7 +17,7 @@ if systemctl --user is-active --quiet sergeant-dashboard.service; then
 	exit 1
 else
 	active_status=$?
-	if [ "$active_status" -ne 3 ]; then
+	if [ "$active_status" -ne 3 ] && [ "$active_status" -ne 4 ]; then
 		printf '%s\n' "Could not verify sergeant-dashboard is inactive; installation preserved" >&2
 		exit 1
 	fi

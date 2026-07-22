@@ -115,23 +115,27 @@ exit 0
 }
 
 func TestUninstallToleratesMissingInactiveService(t *testing.T) {
-	home := t.TempDir()
-	mocks := filepath.Join(t.TempDir(), "bin")
-	mustMkdir(t, mocks)
-	writeExecutable(t, filepath.Join(mocks, "systemctl"), `#!/bin/sh
+	for name, status := range map[string]string{"inactive": "3", "missing": "4"} {
+		t.Run(name, func(t *testing.T) {
+			home := t.TempDir()
+			mocks := filepath.Join(t.TempDir(), "bin")
+			mustMkdir(t, mocks)
+			writeExecutable(t, filepath.Join(mocks, "systemctl"), `#!/bin/sh
 case "$*" in
   "--user disable --now sergeant-dashboard.service") exit 1 ;;
-  "--user is-active --quiet sergeant-dashboard.service") exit 3 ;;
+  "--user is-active --quiet sergeant-dashboard.service") exit `+status+` ;;
 esac
 exit 0
 `)
-	env := append(os.Environ(),
-		"HOME="+home,
-		"XDG_CONFIG_HOME="+filepath.Join(home, "config"),
-		"PATH="+mocks+":/usr/bin:/bin",
-	)
+			env := append(os.Environ(),
+				"HOME="+home,
+				"XDG_CONFIG_HOME="+filepath.Join(home, "config"),
+				"PATH="+mocks+":/usr/bin:/bin",
+			)
 
-	runScript(t, env, "scripts/uninstall.sh")
+			runScript(t, env, "scripts/uninstall.sh")
+		})
+	}
 }
 
 func TestUninstallPreservesArtifactsWhenInactivityCannotBeVerified(t *testing.T) {
