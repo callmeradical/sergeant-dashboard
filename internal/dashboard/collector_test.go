@@ -503,6 +503,48 @@ func TestCollectorClassifiesStaleOrphanedAndCorruptWorkers(t *testing.T) {
 	}
 }
 
+func TestCollectorClassifiesTerminalWorkersCompleteAfterWorktreeCleanup(t *testing.T) {
+	root := t.TempDir()
+	tests := []struct {
+		name       string
+		status     string
+		wantHealth string
+	}{
+		{name: "done", status: "done", wantHealth: "complete"},
+		{name: "failed", status: "failed", wantHealth: "complete"},
+		{name: "failed-with-reason", status: "failed: command exited", wantHealth: "complete"},
+		{name: "in-progress", status: "in_progress", wantHealth: "orphaned"},
+	}
+	for _, test := range tests {
+		worker := filepath.Join(root, test.name, "api")
+		mustMkdirAll(t, worker)
+		writeFile(t, filepath.Join(worker, "status"), test.status+"\n")
+		writeFile(t, filepath.Join(worker, "worktree"), filepath.Join(root, "removed-"+test.name)+"\n")
+	}
+
+	var probes atomic.Int32
+	state := dashboard.Collector{
+		FleetRoot: root,
+		Run: func(context.Context, string, string, ...string) ([]byte, error) {
+			probes.Add(1)
+			return nil, nil
+		},
+	}.Collect(t.Context())
+
+	byTask := make(map[string]dashboard.Worker, len(state.Workers))
+	for _, worker := range state.Workers {
+		byTask[worker.Task] = worker
+	}
+	for _, test := range tests {
+		if got := byTask[test.name].Health; got != test.wantHealth {
+			t.Errorf("%s health = %q, want %q", test.name, got, test.wantHealth)
+		}
+	}
+	if got := probes.Load(); got != 0 {
+		t.Fatalf("probes for missing worktrees = %d, want 0", got)
+	}
+}
+
 func TestCollectorClassifiesLifecycleValues(t *testing.T) {
 	root := t.TempDir()
 	now := time.Date(2026, 7, 21, 12, 0, 0, 0, time.UTC)

@@ -295,12 +295,14 @@ func collectWorker(dir, task, project string, now time.Time, staleAfter time.Dur
 	if worker.Status == "orphaned" {
 		return worker, warnings
 	}
+	if isTerminal(worker.Status) {
+		worker.Health = "complete"
+		return worker, warnings
+	}
 	if worker.Worktree != "" && !worker.enrichable {
 		return worker, warnings
 	}
-	if isTerminal(worker.Status) {
-		worker.Health = "complete"
-	} else if !worker.UpdatedAt.IsZero() && now.Sub(worker.UpdatedAt) > staleAfter {
+	if !worker.UpdatedAt.IsZero() && now.Sub(worker.UpdatedAt) > staleAfter {
 		worker.Health = "stale"
 	} else if worker.Status != "" {
 		worker.Health = "active"
