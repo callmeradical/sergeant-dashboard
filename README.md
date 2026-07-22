@@ -45,7 +45,7 @@ Validate local health, the local UI, Serve configuration, and tailnet HTTPS afte
 ./scripts/validate.sh
 ```
 
-Set both `SERGEANT_TAILNET_URL` and `SERGEANT_TAILNET_HOST` (including the HTTPS port, for example `host.example.ts.net:443`) to validate a different tailnet hostname.
+Set `SERGEANT_TAILNET_URL` to validate a different tailnet hostname. It must be a canonical HTTPS URL on port 443 with exactly the `/sergeant/` path and no userinfo, query, or fragment; the validator derives the Serve host and path from this one URL.
 
 ## Rollback
 

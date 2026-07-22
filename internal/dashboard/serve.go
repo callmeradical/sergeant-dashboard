@@ -4,7 +4,25 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
+	"net/url"
+	"strings"
 )
+
+func ValidateServeURL(input io.Reader, rawURL, backend string) error {
+	parsed, err := url.Parse(rawURL)
+	if err != nil || parsed.Scheme != "https" || parsed.Hostname() == "" || parsed.User != nil || parsed.Opaque != "" {
+		return fmt.Errorf("tailnet URL must be an HTTPS URL without userinfo")
+	}
+	if parsed.Port() != "" && parsed.Port() != "443" {
+		return fmt.Errorf("tailnet URL must use HTTPS port 443")
+	}
+	if parsed.Path != "/sergeant/" || parsed.RawPath != "" || parsed.RawQuery != "" || parsed.ForceQuery || parsed.Fragment != "" {
+		return fmt.Errorf("tailnet URL must use exactly /sergeant/ without query or fragment")
+	}
+	host := net.JoinHostPort(strings.ToLower(parsed.Hostname()), "443")
+	return ValidateServeStatus(input, host, strings.TrimSuffix(parsed.Path, "/"), backend)
+}
 
 func ValidateServeStatus(input io.Reader, host, path, backend string) error {
 	decoder := json.NewDecoder(input)

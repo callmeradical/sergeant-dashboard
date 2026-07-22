@@ -203,6 +203,33 @@ func TestServeStatusRequiresExpectedHTTPSHost(t *testing.T) {
 	}
 }
 
+func TestServeStatusBindsCanonicalHTTPSURL(t *testing.T) {
+	serveStatus := `{"Web":{"cleanthes.taila4fb6a.ts.net:443":{"Handlers":{"/sergeant":{"Proxy":"http://127.0.0.1:8992/sergeant"}}}}}`
+	tests := []struct {
+		name    string
+		url     string
+		wantErr bool
+	}{
+		{name: "approved", url: "https://cleanthes.taila4fb6a.ts.net/sergeant/"},
+		{name: "http", url: "http://cleanthes.taila4fb6a.ts.net/sergeant/", wantErr: true},
+		{name: "wrong-host", url: "https://other-host.ts.net/sergeant/", wantErr: true},
+		{name: "wrong-port", url: "https://cleanthes.taila4fb6a.ts.net:8443/sergeant/", wantErr: true},
+		{name: "userinfo", url: "https://user@cleanthes.taila4fb6a.ts.net/sergeant/", wantErr: true},
+		{name: "query", url: "https://cleanthes.taila4fb6a.ts.net/sergeant/?token=secret", wantErr: true},
+		{name: "fragment", url: "https://cleanthes.taila4fb6a.ts.net/sergeant/#secret", wantErr: true},
+		{name: "wrong-path", url: "https://cleanthes.taila4fb6a.ts.net/other/", wantErr: true},
+		{name: "malformed", url: "://not-a-url", wantErr: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			err := dashboard.ValidateServeURL(bytes.NewBufferString(serveStatus), test.url, "http://127.0.0.1:8992/sergeant")
+			if (err != nil) != test.wantErr {
+				t.Fatalf("ValidateServeURL(%q) error = %v, want error %t", test.url, err, test.wantErr)
+			}
+		})
+	}
+}
+
 func request(t *testing.T, handler http.Handler, method, path string) *httptest.ResponseRecorder {
 	t.Helper()
 	recorder := httptest.NewRecorder()

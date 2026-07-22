@@ -218,6 +218,16 @@ func TestValidationRequiresServePathAndBackendAssociation(t *testing.T) {
 	if output, err := command.CombinedOutput(); err != nil {
 		t.Fatalf("validation rejected associated Serve path/backend: %v: %s", err, output)
 	}
+
+	command = exec.Command("sh", "scripts/validate.sh")
+	command.Env = append(baseEnv,
+		"TAILSCALE_STATUS="+associated,
+		"SERGEANT_TAILNET_URL=https://other-host.ts.net/sergeant/",
+		"SERGEANT_TAILNET_HOST=cleanthes.taila4fb6a.ts.net:443",
+	)
+	if output, err := command.CombinedOutput(); err == nil {
+		t.Fatalf("validation accepted independently mismatched URL and host: %s", output)
+	}
 }
 
 func runScript(t *testing.T, env []string, path string) {
