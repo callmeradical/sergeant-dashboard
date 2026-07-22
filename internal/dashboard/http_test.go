@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os/exec"
 	"strings"
 	"testing"
 	"time"
@@ -48,15 +49,6 @@ func TestHandlerServesHealthStateAndEmbeddedApplication(t *testing.T) {
 	}
 	if policy := app.Header().Get("Content-Security-Policy"); !strings.Contains(policy, "img-src 'self' data:") {
 		t.Fatalf("application content security policy blocks its embedded image: %q", policy)
-	}
-	script := request(t, handler, http.MethodGet, "/sergeant/app.js")
-	if strings.Contains(script.Body.String(), "worker.message?.summary") {
-		t.Fatal("embedded application can render worker message bodies")
-	}
-	for _, required := range []string{"worker.message?.present", "worker.pullRequest?.checks", "worker.noMistakes?.available", "worker.noMistakes?.phase", "worker.graphify?.status", "worker.graphify?.updatedAt"} {
-		if !strings.Contains(script.Body.String(), required) {
-			t.Errorf("embedded application lacks %q", required)
-		}
 	}
 }
 
@@ -123,12 +115,10 @@ func TestStateAPIProjectsBlockedLifecycleStatus(t *testing.T) {
 	}
 }
 
-func TestEmbeddedApplicationLinksOnlyValidTDTaskIDs(t *testing.T) {
-	script := request(t, dashboard.NewHandler(fixedSource{}), http.MethodGet, "/sergeant/app.js").Body.String()
-	for _, required := range []string{"tdTaskLink", "/api/issues/", "encodeURIComponent", "^td-[A-Za-z0-9]+$"} {
-		if !strings.Contains(script, required) {
-			t.Errorf("embedded application lacks safe td link behavior %q", required)
-		}
+func TestEmbeddedApplicationRendersBrowserBehavior(t *testing.T) {
+	command := exec.Command("node", "testdata/frontend_test.mjs")
+	if output, err := command.CombinedOutput(); err != nil {
+		t.Fatalf("frontend behavior: %v: %s", err, output)
 	}
 }
 
