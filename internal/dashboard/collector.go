@@ -15,7 +15,12 @@ import (
 	"time"
 )
 
-const maxScalarBytes = 4096
+const (
+	maxScalarBytes       = 4096
+	maxConcurrentWorkers = 8
+	maxEnrichmentBatches = 4
+	maxEnrichmentTime    = 12 * time.Second
+)
 
 type Collector struct {
 	FleetRoot    string
@@ -125,20 +130,39 @@ func (c Collector) Collect(ctx context.Context) State {
 }
 
 func (c Collector) enrichWorkers(ctx context.Context, workers []Worker) {
-	var wait sync.WaitGroup
-	limit := make(chan struct{}, 8)
-	for index := range workers {
-		wait.Add(1)
-		go func(worker *Worker) {
-			defer wait.Done()
-			select {
-			case limit <- struct{}{}:
-				defer func() { <-limit }()
-				c.enrichWorker(ctx, worker)
-			case <-ctx.Done():
-			}
-		}(&workers[index])
+	probeTimeout := c.ProbeTimeout
+	if probeTimeout <= 0 {
+		probeTimeout = 3 * time.Second
 	}
+	enrichmentTime := maxEnrichmentBatches * probeTimeout
+	if enrichmentTime > maxEnrichmentTime {
+		enrichmentTime = maxEnrichmentTime
+	}
+	enrichmentCtx, cancel := context.WithTimeout(ctx, enrichmentTime)
+	defer cancel()
+
+	workerCount := min(maxConcurrentWorkers, len(workers))
+	jobs := make(chan *Worker)
+	var wait sync.WaitGroup
+	wait.Add(workerCount)
+	for range workerCount {
+		go func() {
+			defer wait.Done()
+			for worker := range jobs {
+				c.enrichWorker(enrichmentCtx, worker)
+			}
+		}()
+	}
+	for index := range workers {
+		select {
+		case jobs <- &workers[index]:
+		case <-enrichmentCtx.Done():
+			close(jobs)
+			wait.Wait()
+			return
+		}
+	}
+	close(jobs)
 	wait.Wait()
 }
 

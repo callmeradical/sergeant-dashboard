@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -82,7 +83,8 @@ func TestCollectorUsesAnIndependentTimeoutForEachProbe(t *testing.T) {
 
 func TestCollectorBoundsDegradedFleetLatency(t *testing.T) {
 	root := t.TempDir()
-	for index := 0; index < 17; index++ {
+	const workerCount = 41
+	for index := 0; index < workerCount; index++ {
 		worker := filepath.Join(root, fmt.Sprintf("task-%02d", index), "api")
 		worktree := filepath.Join(root, fmt.Sprintf("worktree-%02d", index))
 		mustMkdirAll(t, worker)
@@ -104,11 +106,80 @@ func TestCollectorBoundsDegradedFleetLatency(t *testing.T) {
 	state := dashboard.Collector{FleetRoot: root, Run: runner, ProbeTimeout: probeTimeout}.Collect(t.Context())
 	elapsed := time.Since(started)
 
-	if len(state.Workers) != 17 {
-		t.Fatalf("workers = %d, want complete 17-worker projection", len(state.Workers))
+	if len(state.Workers) != workerCount {
+		t.Fatalf("workers = %d, want complete %d-worker projection", len(state.Workers), workerCount)
 	}
-	if elapsed >= 4*probeTimeout {
-		t.Fatalf("degraded collection took %v, want less than %v", elapsed, 4*probeTimeout)
+	if elapsed >= 5*probeTimeout {
+		t.Fatalf("degraded collection took %v, want less than %v", elapsed, 5*probeTimeout)
+	}
+	if got := active.Load(); got != 0 {
+		t.Fatalf("active probes after collection = %d, want 0", got)
+	}
+}
+
+func TestCollectorBoundsGoroutinesIndependentlyOfFleetSize(t *testing.T) {
+	root := t.TempDir()
+	for index := 0; index < 512; index++ {
+		worker := filepath.Join(root, fmt.Sprintf("task-%03d", index), "api")
+		worktree := filepath.Join(root, fmt.Sprintf("worktree-%03d", index))
+		mustMkdirAll(t, worker)
+		mustMkdirAll(t, worktree)
+		writeFile(t, filepath.Join(worker, "status"), "in_progress\n")
+		writeFile(t, filepath.Join(worker, "worktree"), worktree+"\n")
+	}
+
+	release := make(chan struct{})
+	ready := make(chan struct{})
+	var active atomic.Int32
+	var once sync.Once
+	runner := func(ctx context.Context, _ string, _ string, _ ...string) ([]byte, error) {
+		if active.Add(1) == 16 {
+			once.Do(func() { close(ready) })
+		}
+		defer active.Add(-1)
+		select {
+		case <-release:
+			return []byte(`{}`), nil
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+
+	baseline := runtime.NumGoroutine()
+	done := make(chan struct{})
+	go func() {
+		dashboard.Collector{FleetRoot: root, Run: runner, ProbeTimeout: time.Second}.Collect(t.Context())
+		close(done)
+	}()
+	select {
+	case <-ready:
+	case <-time.After(time.Second):
+		close(release)
+		t.Fatal("collector did not reach its active probe limit")
+	}
+
+	maximumGrowth := 0
+	measurement := time.NewTimer(25 * time.Millisecond)
+	ticker := time.NewTicker(time.Millisecond)
+measure:
+	for {
+		select {
+		case <-ticker.C:
+			maximumGrowth = max(maximumGrowth, runtime.NumGoroutine()-baseline)
+		case <-measurement.C:
+			break measure
+		}
+	}
+	ticker.Stop()
+	close(release)
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("collector did not release blocked probes")
+	}
+
+	if maximumGrowth > 40 {
+		t.Fatalf("goroutine growth = %d, want at most 40 independently of fleet size", maximumGrowth)
 	}
 	if got := active.Load(); got != 0 {
 		t.Fatalf("active probes after collection = %d, want 0", got)
