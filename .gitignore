@@ -7,6 +7,7 @@
 *.dll
 *.so
 *.dylib
+/sergeant-dashboard
 
 # Test binary, built with `go test -c`
 *.test
@@ -26,6 +27,10 @@ go.work.sum
 
 # env file
 .env
+
+# Local agent and code-graph state
+.sergeant-*
+graphify-out/
 
 # Editor/IDE
 # .idea/

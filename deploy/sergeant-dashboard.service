@@ -1,0 +1,19 @@
+[Unit]
+Description=Read-only Sergeant dashboard
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# The binary fixes its listener to 127.0.0.1:8992.
+ExecStart=%h/.local/bin/sergeant-dashboard
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>Sergeant | Fleet command</title>
+  <link rel="stylesheet" href="app.css">
+</head>
+<body>
+  <div class="grain"></div>
+  <header>
+    <div>
+      <p class="eyebrow">SERGEANT / OPERATIONS</p>
+      <h1>Fleet command</h1>
+    </div>
+    <div class="live"><span></span> READ-ONLY</div>
+  </header>
+  <main>
+    <section class="overview" aria-label="Fleet overview">
+      <div><strong id="total">-</strong><span>workers</span></div>
+      <div><strong id="active">-</strong><span>active</span></div>
+      <div><strong id="attention">-</strong><span>attention</span></div>
+      <p id="updated">Awaiting telemetry</p>
+    </section>
+    <section class="toolbar">
+      <h2>Deployment board</h2>
+      <div class="filters" role="group" aria-label="Filter workers">
+        <button class="selected" data-filter="all">All</button>
+        <button data-filter="active">Active</button>
+        <button data-filter="attention">Attention</button>
+      </div>
+    </section>
+    <div id="warnings" class="warnings" hidden></div>
+    <section id="workers" class="workers" aria-live="polite">
+      <p class="empty">Loading fleet state...</p>
+    </section>
+  </main>
+  <footer>LOCAL TELEMETRY <span>NO COMMAND CHANNEL</span></footer>
+  <script src="app.js"></script>
+</body>
+</html>
