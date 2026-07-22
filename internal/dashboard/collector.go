@@ -1,6 +1,7 @@
 package dashboard
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -8,7 +9,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"regexp"
 	"sort"
 	"strings"
 	"sync"
@@ -17,6 +17,7 @@ import (
 
 const (
 	maxScalarBytes       = 4096
+	maxOperationalBytes  = 64 << 10
 	maxConcurrentWorkers = 8
 	maxEnrichmentBatches = 4
 	maxEnrichmentTime    = 12 * time.Second
@@ -43,14 +44,19 @@ type State struct {
 type Worker struct {
 	Task        string        `json:"task"`
 	Project     string        `json:"project"`
+	Repository  string        `json:"repository,omitempty"`
 	Status      string        `json:"status,omitempty"`
 	Health      string        `json:"health"`
 	Agent       string        `json:"agent,omitempty"`
 	Branch      string        `json:"branch,omitempty"`
 	TDTask      string        `json:"tdTask,omitempty"`
+	TD          FileMetadata  `json:"td"`
 	Worktree    string        `json:"worktree,omitempty"`
 	UpdatedAt   time.Time     `json:"updatedAt,omitempty"`
 	Message     FileMetadata  `json:"message"`
+	Diagnostic  FileMetadata  `json:"diagnostic"`
+	Log         FileMetadata  `json:"log"`
+	Handoff     FileMetadata  `json:"handoff"`
 	PullRequest PullRequest   `json:"pullRequest"`
 	NoMistakes  ToolStatus    `json:"noMistakes"`
 	Graphify    FileMetadata  `json:"graphify"`
@@ -62,12 +68,22 @@ type FileMetadata struct {
 	Present   bool      `json:"present"`
 	UpdatedAt time.Time `json:"updatedAt,omitempty"`
 	Summary   string    `json:"summary,omitempty"`
+	Status    string    `json:"status,omitempty"`
 }
 
 type PullRequest struct {
-	URL    string  `json:"url,omitempty"`
-	State  string  `json:"state,omitempty"`
-	Checks []Check `json:"checks"`
+	URL      string    `json:"url,omitempty"`
+	State    string    `json:"state,omitempty"`
+	Checks   []Check   `json:"checks"`
+	Comments []Comment `json:"comments"`
+	Status   string    `json:"status,omitempty"`
+}
+
+type Comment struct {
+	Author    string    `json:"author,omitempty"`
+	Body      string    `json:"body,omitempty"`
+	URL       string    `json:"url,omitempty"`
+	CreatedAt time.Time `json:"createdAt,omitempty"`
 }
 
 type Check struct {
@@ -80,6 +96,8 @@ type Check struct {
 type ToolStatus struct {
 	Available bool   `json:"available"`
 	Phase     string `json:"phase,omitempty"`
+	Summary   string `json:"summary,omitempty"`
+	Status    string `json:"status,omitempty"`
 }
 
 type AuditMetadata struct {
@@ -143,13 +161,19 @@ func (c Collector) enrichWorkers(ctx context.Context, workers []Worker) {
 	if probeTimeout <= maxEnrichmentTime/maxEnrichmentBatches {
 		enrichmentTime = maxEnrichmentBatches * probeTimeout
 	}
-	enrichableWorkers := 0
+	probeCount := 0
 	for index := range workers {
 		if workers[index].enrichable {
-			enrichableWorkers++
+			probeCount += 2
+			if workers[index].Repository == "" {
+				probeCount++
+			}
+			if tdTaskID.MatchString(workers[index].TDTask) {
+				probeCount++
+			}
 		}
 	}
-	batchCount := (enrichableWorkers + maxConcurrentWorkers - 1) / maxConcurrentWorkers
+	batchCount := (probeCount + cap(processProbeSlots) - 1) / cap(processProbeSlots)
 	if batchCount > 0 {
 		probeTimeout = min(probeTimeout, enrichmentTime/time.Duration(batchCount))
 	}
@@ -215,34 +239,94 @@ func (c Collector) enrichWorker(parent context.Context, worker *Worker) {
 	}
 	pullRequest := make(chan PullRequest, 1)
 	go func() {
-		result := PullRequest{Checks: []Check{}}
-		output, err := runLimitedProbe(parent, timeout, run, worker.Worktree, "gh", "pr", "view", "--json", "url,state,statusCheckRollup")
-		if err == nil && len(output) <= 1<<20 {
+		result := PullRequest{Checks: []Check{}, Comments: []Comment{}, Status: "unavailable"}
+		output, err := runLimitedProbe(parent, timeout, run, worker.Worktree, "gh", "pr", "view", "--json", "url,state,statusCheckRollup,comments")
+		if err == nil && len(output) > 1<<20 {
+			result.Status = "oversized"
+		} else if err == nil {
 			var response struct {
 				URL               string  `json:"url"`
 				State             string  `json:"state"`
 				StatusCheckRollup []Check `json:"statusCheckRollup"`
+				Comments          []struct {
+					Author struct {
+						Login string `json:"login"`
+					} `json:"author"`
+					Body      string    `json:"body"`
+					URL       string    `json:"url"`
+					CreatedAt time.Time `json:"createdAt"`
+				} `json:"comments"`
 			}
 			if json.Unmarshal(output, &response) == nil {
 				if response.StatusCheckRollup == nil {
 					response.StatusCheckRollup = []Check{}
 				}
-				result = PullRequest{URL: response.URL, State: response.State, Checks: response.StatusCheckRollup}
+				comments := make([]Comment, 0, len(response.Comments))
+				for _, comment := range response.Comments {
+					comments = append(comments, Comment{Author: RedactText(comment.Author.Login), Body: RedactText(comment.Body), URL: RedactText(comment.URL), CreatedAt: comment.CreatedAt})
+				}
+				result = PullRequest{URL: response.URL, State: response.State, Checks: response.StatusCheckRollup, Comments: comments, Status: "available"}
+			} else {
+				result.Status = "corrupt"
 			}
 		}
 		pullRequest <- result
 	}()
 	noMistakes := make(chan ToolStatus, 1)
 	go func() {
-		result := ToolStatus{}
+		result := ToolStatus{Status: "unavailable"}
 		output, err := runLimitedProbe(parent, timeout, run, worker.Worktree, "no-mistakes", "runs", "--limit", "1")
-		if err == nil {
-			result = ToolStatus{Available: true, Phase: noMistakesPhase(output)}
+		if err == nil && len(output) > maxOperationalBytes {
+			result.Status = "oversized"
+		} else if err == nil {
+			summary := strings.TrimSpace(RedactText(string(output)))
+			if summary == "" {
+				result.Status = "corrupt"
+			} else {
+				result = ToolStatus{Available: true, Phase: noMistakesPhase(output), Summary: summary, Status: "available"}
+			}
 		}
 		noMistakes <- result
 	}()
+	td := make(chan FileMetadata, 1)
+	go func() {
+		if !tdTaskID.MatchString(worker.TDTask) {
+			td <- FileMetadata{}
+			return
+		}
+		output, err := runLimitedProbe(parent, timeout, run, worker.Worktree, "td", "context", worker.TDTask)
+		if err != nil || len(output) > maxOperationalBytes {
+			status := "unavailable"
+			if err == nil {
+				status = "oversized"
+			}
+			td <- FileMetadata{Present: true, Summary: "[content unavailable: " + status + "]", Status: status}
+			return
+		}
+		summary := strings.TrimSpace(RedactText(string(output)))
+		if summary == "" {
+			td <- FileMetadata{Present: true, Summary: "[content unavailable: corrupt]", Status: "corrupt"}
+			return
+		}
+		td <- FileMetadata{Present: true, Summary: summary, Status: "available"}
+	}()
+	repository := make(chan string, 1)
+	go func() {
+		if worker.Repository != "" {
+			repository <- worker.Repository
+			return
+		}
+		output, err := runLimitedProbe(parent, timeout, run, worker.Worktree, "git", "remote", "get-url", "origin")
+		if err != nil || len(output) > maxScalarBytes {
+			repository <- ""
+			return
+		}
+		repository <- repositoryFromRemote(strings.TrimSpace(string(output)))
+	}()
 	worker.PullRequest = <-pullRequest
 	worker.NoMistakes = <-noMistakes
+	worker.TD = <-td
+	worker.Repository = <-repository
 }
 
 func runLimitedProbe(parent context.Context, timeout time.Duration, run Runner, dir, name string, args ...string) ([]byte, error) {
@@ -276,7 +360,29 @@ func noMistakesPhase(output []byte) string {
 func runCommand(ctx context.Context, dir, name string, args ...string) ([]byte, error) {
 	command := exec.CommandContext(ctx, name, args...)
 	command.Dir = dir
-	return command.Output()
+	output := boundedBuffer{remaining: (1 << 20) + 1}
+	command.Stdout = &output
+	if err := command.Run(); err != nil {
+		return nil, err
+	}
+	return output.Bytes(), nil
+}
+
+type boundedBuffer struct {
+	bytes.Buffer
+	remaining int
+}
+
+func (buffer *boundedBuffer) Write(data []byte) (int, error) {
+	written := len(data)
+	if len(data) > buffer.remaining {
+		data = data[:buffer.remaining]
+	}
+	if len(data) > 0 {
+		_, _ = buffer.Buffer.Write(data)
+		buffer.remaining -= len(data)
+	}
+	return written, nil
 }
 
 func collectWorker(dir, task, project string, now time.Time, staleAfter time.Duration) (Worker, []string) {
@@ -291,9 +397,13 @@ func collectWorker(dir, task, project string, now time.Time, staleAfter time.Dur
 	}
 	worker.Agent, _, _ = readScalarWithTime(filepath.Join(dir, "agent"))
 	worker.Branch, _, _ = readScalarWithTime(filepath.Join(dir, "branch"))
+	worker.Repository, _, _ = readScalarWithTime(filepath.Join(dir, "repository"))
 	worker.TDTask, _, _ = readScalarWithTime(filepath.Join(dir, "td_task"))
 	worker.Worktree, _, _ = readScalarWithTime(filepath.Join(dir, "worktree"))
-	worker.Message = fileMetadata(filepath.Join(dir, "message"))
+	worker.Message = operationalFile(filepath.Join(dir, "message"))
+	worker.Diagnostic = operationalFile(filepath.Join(dir, "diagnostic"))
+	worker.Log = operationalFile(filepath.Join(dir, "worker.log"))
+	worker.Handoff = operationalFile(filepath.Join(dir, "handoff"))
 	if worker.Worktree != "" {
 		if info, statErr := os.Stat(worker.Worktree); statErr == nil && info.IsDir() {
 			worker.enrichable = true
@@ -347,13 +457,19 @@ func fileMetadata(path string) FileMetadata {
 }
 
 func graphifyMetadata(worktree string) FileMetadata {
-	report := fileMetadata(filepath.Join(worktree, "graphify-out", "GRAPH_REPORT.md"))
+	report := operationalFile(filepath.Join(worktree, "graphify-out", "GRAPH_REPORT.md"))
 	pending := fileMetadata(filepath.Join(worktree, "graphify-out", ".needs_update"))
 	if pending.Present {
-		return FileMetadata{Present: true, UpdatedAt: latestTime(report.UpdatedAt, pending.UpdatedAt), Summary: "update pending"}
+		if report.Summary == "" {
+			report.Summary = "update pending"
+		} else {
+			report.Summary = "update pending\n" + report.Summary
+		}
+		report.Present = true
+		report.UpdatedAt = latestTime(report.UpdatedAt, pending.UpdatedAt)
 	}
-	if report.Present {
-		report.Summary = "ready"
+	if !report.Present {
+		report.Status = "missing"
 	}
 	return report
 }
@@ -371,59 +487,4 @@ func latestTime(left, right time.Time) time.Time {
 		return right
 	}
 	return left
-}
-
-var (
-	sensitiveKey = regexp.MustCompile(`(?i)(authorization|body|cookie|credential|env|message|password|prompt|secret|token)`)
-	secretValue  = regexp.MustCompile(`(?i)(bearer\s+)[^\s,;]+|((?:credential|password|secret|token)\s*[:=]\s*)[^\s,;]+|gh[pousr]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,}|sk-[A-Za-z0-9_-]{20,}`)
-)
-
-func RedactMetadata(value any) any {
-	switch typed := value.(type) {
-	case map[string]any:
-		redacted := make(map[string]any, len(typed))
-		for key, item := range typed {
-			if sensitiveKey.MatchString(key) {
-				redacted[key] = "[REDACTED]"
-			} else {
-				redacted[key] = RedactMetadata(item)
-			}
-		}
-		return redacted
-	case []any:
-		redacted := make([]any, len(typed))
-		for index, item := range typed {
-			redacted[index] = RedactMetadata(item)
-		}
-		return redacted
-	case string:
-		return redactString(typed)
-	default:
-		return value
-	}
-}
-
-func redactString(value string) string {
-	return secretValue.ReplaceAllStringFunc(value, func(match string) string {
-		lower := strings.ToLower(match)
-		if strings.HasPrefix(lower, "bearer ") {
-			return "Bearer [REDACTED]"
-		}
-		if index := strings.IndexAny(match, "=:"); index >= 0 {
-			end := index + 1
-			for end < len(match) && (match[end] == ' ' || match[end] == '\t') {
-				end++
-			}
-			return match[:end] + "[REDACTED]"
-		}
-		return "[REDACTED]"
-	})
-}
-
-func MustJSON(value any) string {
-	data, err := json.Marshal(value)
-	if err != nil {
-		panic(err)
-	}
-	return string(data)
 }

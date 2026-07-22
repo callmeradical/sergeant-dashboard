@@ -10,14 +10,7 @@ const text = (tag, value, className) => {
 };
 
 const tdTaskLink = value => {
-  if (!/^td-[A-Za-z0-9]+$/.test(value || '')) return text('dd', value);
-  const node = document.createElement('dd');
-  const link = document.createElement('a');
-  link.href = `http://127.0.0.1:8991/api/issues/${encodeURIComponent(value)}`;
-  link.rel = 'noreferrer';
-  link.textContent = value;
-  node.append(link);
-  return node;
+  return text('dd', /^td-[A-Za-z0-9]+$/.test(value || '') ? value : '');
 };
 
 function render() {
@@ -28,7 +21,7 @@ function render() {
   document.querySelector('#updated').textContent = `Updated ${new Date(state.collectedAt).toLocaleString()}`;
   const warnings = document.querySelector('#warnings');
   warnings.hidden = !state.warnings.length;
-  warnings.textContent = state.warnings.length ? `${state.warnings.length} source warning${state.warnings.length === 1 ? '' : 's'}` : '';
+  warnings.textContent = state.warnings.join('\n');
 
   workersNode.replaceChildren();
   const shown = state.workers.filter(worker => filter === 'all' || (filter === 'attention' ? ['stale', 'orphaned'].includes(worker.health) : worker.health === filter));
@@ -48,7 +41,7 @@ function workerCard(worker) {
   card.append(head);
   const meta = document.createElement('dl');
   meta.className = 'meta';
-  [['Status', worker.status], ['Agent', worker.agent]].forEach(([label, value]) => {
+  [['Repository', worker.repository], ['Status', worker.status], ['Agent', worker.agent], ['Branch', worker.branch], ['Worktree', worker.worktree]].forEach(([label, value]) => {
     meta.append(text('dt', label), text('dd', value));
   });
   meta.append(text('dt', 'td'), tdTaskLink(worker.tdTask));
@@ -60,20 +53,47 @@ function workerCard(worker) {
     link.rel = 'noreferrer';
     link.textContent = worker.pullRequest.state || 'View PR';
     value.append(link); meta.append(value);
+  } else if (worker.pullRequest?.status) {
+    meta.append(text('dt', 'Pull request'), text('dd', worker.pullRequest.status));
+  }
+  if (worker.pullRequest?.url && worker.pullRequest?.status) {
+    meta.append(text('dt', 'PR source'), text('dd', worker.pullRequest.status));
   }
   if (worker.pullRequest?.checks?.length) {
     const checks = worker.pullRequest.checks.map(check => `${check.name || 'check'}: ${check.conclusion || check.state || check.status || 'pending'}`);
     meta.append(text('dt', 'Checks'), text('dd', checks.join(', ')));
   }
+  if (worker.pullRequest?.comments?.length) {
+    const comments = document.createElement('dd');
+    worker.pullRequest.comments.forEach((comment, index) => {
+      if (index) comments.append(document.createElement('br'));
+      comments.append(document.createTextNode(`${comment.author || 'comment'}: ${comment.body || '-'} `));
+      if (comment.url) {
+        const link = document.createElement('a');
+        link.href = comment.url; link.rel = 'noreferrer'; link.textContent = 'View comment'; comments.append(link);
+      }
+    });
+    meta.append(text('dt', 'Comments'), comments);
+  }
   if (worker.message?.present) {
-    meta.append(text('dt', 'Message'), text('dd', worker.message.updatedAt ? `updated ${new Date(worker.message.updatedAt).toLocaleString()}` : 'present'));
+    meta.append(text('dt', 'Message'), text('dd', worker.message.summary || (worker.message.updatedAt ? `updated ${new Date(worker.message.updatedAt).toLocaleString()}` : 'present')));
   }
-  if (worker.noMistakes?.available) {
-    meta.append(text('dt', 'no-mistakes'), text('dd', worker.noMistakes?.phase ? `${worker.noMistakes.phase} phase` : 'run detected'));
+  [['Diagnostic', worker.diagnostic], ['Log', worker.log], ['Handoff', worker.handoff], ['td details', worker.td]].forEach(([label, file]) => {
+    if (file?.present) meta.append(text('dt', label), text('dd', file.summary || 'present'));
+  });
+  if (worker.noMistakes?.available || worker.noMistakes?.status) {
+    meta.append(text('dt', 'no-mistakes'), text('dd', worker.noMistakes?.summary || worker.noMistakes?.status || (worker.noMistakes?.phase ? `${worker.noMistakes.phase} phase` : 'run detected')));
   }
-  if (worker.graphify?.present) {
-    const updated = worker.graphify?.updatedAt ? `, ${new Date(worker.graphify.updatedAt).toLocaleString()}` : '';
-    meta.append(text('dt', 'Graphify'), text('dd', `${worker.graphify?.status || 'available'}${updated}`));
+  if (worker.graphify?.present || worker.graphify?.status) {
+    meta.append(text('dt', 'Graphify'), text('dd', worker.graphify?.summary || worker.graphify?.status || 'available'));
+  }
+  if (worker.ocInject?.responsePending) {
+    const pendingAt = worker.ocInject.responsePendingAt ? ` since ${new Date(worker.ocInject.responsePendingAt).toLocaleString()}` : '';
+    meta.append(text('dt', 'oc-inject'), text('dd', `response pending${pendingAt}`));
+  }
+  if (worker.ocInject?.responseAcked) {
+    const ackedAt = worker.ocInject.responseAckedAt ? ` at ${new Date(worker.ocInject.responseAckedAt).toLocaleString()}` : '';
+    meta.append(text('dt', 'oc-inject'), text('dd', `response acknowledged${ackedAt}`));
   }
   card.append(meta);
   const signals = document.createElement('div');

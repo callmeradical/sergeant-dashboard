@@ -2,7 +2,9 @@
 
 Read-only operational dashboard for Sergeant fleets, delivery gates, and project activity. The Go binary embeds its responsive frontend and projects source state without changing Sergeant, td, GitHub, no-mistakes, Graphify, oc-inject, repositories, or worker processes.
 
-The collector deliberately reads only whitelisted scalar metadata. The HTTP boundary emits opaque task/project aliases, validated td IDs and PR links, enumerated lifecycle/tool states, and body-free file metadata. Worker-message presence and timestamps are visible, but source names, branches, worktree paths, message contents, prompt bodies, injected message bodies, logs, command output, tokens, environment values, secrets, and credentials are neither rendered nor persisted.
+The dashboard is a trusted single-operator projection for local and tailnet use. It preserves configured task, project, and repository identity; branches and worktrees; operational messages, diagnostics, logs, and handoffs; td context; GitHub pull requests, checks, and comments; no-mistakes output; Graphify reports; and oc-inject transport metadata.
+
+All projected text passes through one bounded, deterministic redaction boundary before HTTP serialization. Credential-bearing URLs, authorization values, tokens, passwords, secret assignments, sensitive environment values, control bytes, and repository secret files are removed or left unread. Prompt, injected response, and oc-inject transport bodies are never collected. Missing, unreadable, corrupt, oversized, or timed-out sources are reported without substituting stale fleet state. The dashboard remains strictly read-only and exposes no mutation controls.
 
 ## Build and run
 

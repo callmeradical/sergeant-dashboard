@@ -156,10 +156,11 @@ for (const viewport of ['1280,900', '390,844']) {
   assert.equal(rendered.total, '2');
   assert.equal(rendered.active, '1');
   assert.equal(rendered.attention, '1');
-  assert.equal(rendered.warnings, '1 source warning');
-  for (const expected of ['in_progress', 'opencode', 'check 1: SUCCESS', 'review phase', 'ready', 'message', 'graphify', 'no-mistakes', 'oc-inject']) assert.match(rendered.text, new RegExp(expected));
-  for (const forbidden of ['raw-private-task', 'raw-private-project', 'secret-branch', '/secret/worktree', 'secret message body', 'token=secret', 'private check name', 'secret source warning']) assert.doesNotMatch(rendered.text, new RegExp(forbidden));
-  assert.deepEqual(rendered.links, ['http://127.0.0.1:8991/api/issues/td-123', 'https://github.com/acme/widget/pull/7']);
+  assert.equal(rendered.warnings, 'source delayed token=[REDACTED]');
+  for (const expected of ['raw-private-task', 'raw-private-project', 'secret-branch', '/secret/worktree', 'approval needed', 'worker recovered', 'tests passed', 'remaining: open PR', 'private check name: SUCCESS', 'available truncated', 'review passed', 'Collector connects fleet state', 'response pending', 'unavailable', 'missing', 'message', 'graphify', 'no-mistakes', 'oc-inject']) assert.match(rendered.text, new RegExp(expected));
+  for (const forbidden of ['token=secret']) assert.doesNotMatch(rendered.text, new RegExp(forbidden));
+  assert.deepEqual(rendered.links, ['https://github.com/acme/widget/pull/7', 'https://github.com/acme/widget/pull/7#issuecomment-1']);
+  assert.match(rendered.text, /td-123/);
   assert.ok(rendered.documentWidth <= rendered.viewportWidth, `horizontal overflow at ${viewport}`);
   assert.equal(rendered.toolbarDirection, viewport.startsWith('390') ? 'column' : 'row');
 }

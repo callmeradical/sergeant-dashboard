@@ -124,8 +124,8 @@ func TestStateAPIBoundsProbeConcurrencyAcrossRequests(t *testing.T) {
 	if got := maximum.Load(); got > 16 {
 		t.Fatalf("maximum active probes across requests = %d, want at most 16", got)
 	}
-	if got := total.Load(); got != 16 {
-		t.Fatalf("probes across overlapping requests = %d, want one shared 16-probe collection", got)
+	if got := total.Load(); got != 24 {
+		t.Fatalf("probes across overlapping requests = %d, want one shared 24-probe collection", got)
 	}
 	for response := range responses {
 		body := response.Body.String()
@@ -213,23 +213,51 @@ func TestStateAPICancelsSharedCollectionAfterAllRequestsCancel(t *testing.T) {
 	<-done
 }
 
-func TestStateAPIProjectsOnlyAllowlistedMetadata(t *testing.T) {
+func TestStateAPIReturnsNoStoreServiceUnavailableWhenCollectionIsCanceled(t *testing.T) {
+	source := sourceFunc(func(ctx context.Context) dashboard.State {
+		<-ctx.Done()
+		return dashboard.State{Workers: []dashboard.Worker{{Task: "stale-worker"}}, Warnings: []string{"private diagnostic"}}
+	})
+	handler := dashboard.NewHandler(source)
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	request := httptest.NewRequest(http.MethodGet, "/sergeant/api/state", nil).WithContext(ctx)
+	response := httptest.NewRecorder()
+
+	handler.ServeHTTP(response, request)
+
+	if response.Code != http.StatusServiceUnavailable {
+		t.Fatalf("state response = %d %q, want 503", response.Code, response.Body.String())
+	}
+	if got := response.Header().Get("Cache-Control"); got != "no-store" {
+		t.Fatalf("state cache control = %q, want no-store", got)
+	}
+	if strings.Contains(response.Body.String(), "stale-worker") || strings.Contains(response.Body.String(), "private diagnostic") {
+		t.Fatalf("degraded response exposed stale or private state: %q", response.Body.String())
+	}
+}
+
+func TestStateAPIProjectsTrustedOperatorContextWithSecretsRedacted(t *testing.T) {
 	state := dashboard.State{
 		Workers: []dashboard.Worker{{
-			Task: "injected-prompt-body-89e093", Project: "private-repository", Status: "in_progress", Health: "active", Agent: "opencode",
-			Branch: "opaque-branch-secret", TDTask: "td-7ab86d", Worktree: "/private/repository/path",
-			Message: dashboard.FileMetadata{Present: true, Summary: "raw injected message body"},
+			Task: "build-dashboard-89e093", Project: "sergeant-dashboard", Repository: "callmeradical/sergeant-dashboard", Status: "needs_input: approve rollout", Health: "active", Agent: "opencode",
+			Branch: "feat/trusted-dashboard", TDTask: "td-7ab86d", Worktree: "/srv/repos/sergeant-dashboard",
+			Message:    dashboard.FileMetadata{Present: true, Summary: "Approval needed; token=opaque-api-secret"},
+			Diagnostic: dashboard.FileMetadata{Present: true, Summary: "collector delayed; retry is safe"},
+			Log:        dashboard.FileMetadata{Present: true, Summary: "validated 42 workers"},
+			Handoff:    dashboard.FileMetadata{Present: true, Summary: "remaining: open PR"},
 			PullRequest: dashboard.PullRequest{
 				URL:   "https://github.com/acme/widget/pull/7?access_token=opaque-api-secret",
 				State: "OPEN",
 				Checks: []dashboard.Check{{
-					Name: "credential copied from API", Status: "COMPLETED", Conclusion: "SUCCESS", State: "PENDING",
+					Name: "integration tests", Status: "COMPLETED", Conclusion: "SUCCESS", State: "PENDING",
 				}},
+				Comments: []dashboard.Comment{{Author: "operator", Body: "Looks good; password=hunter2"}},
 			},
-			NoMistakes: dashboard.ToolStatus{Available: true, Phase: "review"},
-			Graphify:   dashboard.FileMetadata{Present: true, Summary: "ready"},
+			NoMistakes: dashboard.ToolStatus{Available: true, Phase: "review", Summary: "review passed"},
+			Graphify:   dashboard.FileMetadata{Present: true, Summary: "god nodes: Collector"},
 		}},
-		Warnings: []string{"worker injected-prompt-body-89e093 has credential opaque-warning-secret"},
+		Warnings: []string{"worker delayed; Authorization: Bearer opaque-warning-secret"},
 	}
 
 	response := request(t, dashboard.NewHandler(fixedSource{state: state}), http.MethodGet, "/sergeant/api/state")
@@ -238,18 +266,20 @@ func TestStateAPIProjectsOnlyAllowlistedMetadata(t *testing.T) {
 	}
 	body := response.Body.String()
 	for _, forbidden := range []string{
-		"injected-prompt-body", "private-repository", "opaque-branch-secret", "/private/repository/path",
-		"raw injected message body", "access_token", "opaque-api-secret", "credential copied from API", "opaque-warning-secret",
-		`"branch"`, `"worktree"`, `"summary"`,
+		"opaque-api-secret", "hunter2", "opaque-warning-secret", "access_token",
 	} {
 		if strings.Contains(body, forbidden) {
 			t.Errorf("state API exposed non-allowlisted value %q: %s", forbidden, body)
 		}
 	}
 	for _, allowed := range []string{
-		`"status":"in_progress"`, `"health":"active"`, `"agent":"opencode"`, `"tdTask":"td-7ab86d"`,
-		`"url":"https://github.com/acme/widget/pull/7"`, `"state":"OPEN"`, `"status":"COMPLETED"`,
-		`"conclusion":"SUCCESS"`, `"state":"PENDING"`, `"phase":"review"`, `"graphify":{"present":true`,
+		`"task":"build-dashboard-89e093"`, `"project":"sergeant-dashboard"`, `"status":"needs_input: approve rollout"`,
+		`"repository":"callmeradical/sergeant-dashboard"`,
+		`"branch":"feat/trusted-dashboard"`, `"tdTask":"td-7ab86d"`, `"worktree":"/srv/repos/sergeant-dashboard"`,
+		`"summary":"Approval needed; token=[REDACTED]"`, `"summary":"collector delayed; retry is safe"`,
+		`"summary":"validated 42 workers"`, `"summary":"remaining: open PR"`, `"name":"integration tests"`,
+		`"body":"Looks good; password=[REDACTED]"`, `"summary":"review passed"`, `"summary":"god nodes: Collector"`,
+		`"warnings":["worker delayed; Authorization: Bearer [REDACTED]"]`,
 	} {
 		if !strings.Contains(body, allowed) {
 			t.Errorf("state API omitted allowlisted value %q: %s", allowed, body)
@@ -286,17 +316,21 @@ func TestEmbeddedApplicationRendersBrowserBehavior(t *testing.T) {
 			{
 				Task: "raw-private-task", Project: "raw-private-project", Status: "in_progress", Health: "active", Agent: "opencode",
 				Branch: "secret-branch", TDTask: "td-123", Worktree: "/secret/worktree",
-				Message: dashboard.FileMetadata{Present: true, Summary: "secret message body"},
+				Message:    dashboard.FileMetadata{Present: true, Summary: "approval needed; token=secret"},
+				Diagnostic: dashboard.FileMetadata{Present: true, Summary: "worker recovered"},
+				Log:        dashboard.FileMetadata{Present: true, Summary: "tests passed"},
+				Handoff:    dashboard.FileMetadata{Present: true, Summary: "remaining: open PR"},
 				PullRequest: dashboard.PullRequest{
-					URL: "https://github.com/acme/widget/pull/7?token=secret", State: "OPEN",
-					Checks: []dashboard.Check{{Name: "private check name", Conclusion: "SUCCESS"}},
+					URL: "https://github.com/acme/widget/pull/7?token=secret", State: "OPEN", Status: "available truncated",
+					Checks:   []dashboard.Check{{Name: "private check name", Conclusion: "SUCCESS"}},
+					Comments: []dashboard.Comment{{Author: "reviewer", Body: "approved", URL: "https://github.com/acme/widget/pull/7#issuecomment-1"}},
 				},
-				NoMistakes: dashboard.ToolStatus{Available: true, Phase: "review"}, Graphify: dashboard.FileMetadata{Present: true, Summary: "ready"},
+				NoMistakes: dashboard.ToolStatus{Available: true, Phase: "review", Summary: "review passed"}, Graphify: dashboard.FileMetadata{Present: true, Summary: "Collector connects fleet state"},
 				OCInject: dashboard.AuditMetadata{ResponsePending: true},
 			},
-			{Task: "stale-task", Project: "stale-project", Status: "blocked", Health: "stale", TDTask: "invalid task"},
+			{Task: "stale-task", Project: "stale-project", Status: "blocked", Health: "stale", TDTask: "invalid task", NoMistakes: dashboard.ToolStatus{Status: "unavailable"}, Graphify: dashboard.FileMetadata{Status: "missing"}},
 		},
-		Warnings: []string{"secret source warning"},
+		Warnings: []string{"source delayed token=secret"},
 	}
 	valid := dashboard.NewHandler(fixedSource{state: state})
 	empty := dashboard.NewHandler(fixedSource{state: dashboard.State{Workers: []dashboard.Worker{}, Warnings: []string{}}})

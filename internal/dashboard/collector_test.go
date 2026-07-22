@@ -2,6 +2,7 @@ package dashboard_test
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -121,6 +122,7 @@ func TestCollectorUsesAnIndependentTimeoutForEachProbe(t *testing.T) {
 	mustMkdirAll(t, worktree)
 	writeFile(t, filepath.Join(worker, "status"), "in_progress\n")
 	writeFile(t, filepath.Join(worker, "worktree"), worktree+"\n")
+	writeFile(t, filepath.Join(worker, "repository"), "acme/api\n")
 
 	runner := func(ctx context.Context, _ string, name string, _ ...string) ([]byte, error) {
 		if name == "gh" {
@@ -169,7 +171,7 @@ func TestCollectorBoundsDegradedFleetLatency(t *testing.T) {
 	if len(state.Workers) != workerCount {
 		t.Fatalf("workers = %d, want complete %d-worker projection", len(state.Workers), workerCount)
 	}
-	if got, want := startedProbes.Load(), int32(2*workerCount); got != want {
+	if got, want := startedProbes.Load(), int32(3*workerCount); got != want {
 		t.Fatalf("started probes = %d, want complete enrichment with %d probes", got, want)
 	}
 	if elapsed >= 5*probeTimeout {
@@ -372,9 +374,10 @@ func TestCollectorEnrichesWorkerWithReadOnlyDeliveryMetadata(t *testing.T) {
 	mustMkdirAll(t, filepath.Join(worktree, "graphify-out"))
 	writeFile(t, filepath.Join(worker, "status"), "in_progress\n")
 	writeFile(t, filepath.Join(worker, "worktree"), worktree+"\n")
+	writeFile(t, filepath.Join(worker, "repository"), "acme/api\n")
+	writeFile(t, filepath.Join(worker, "td_task"), "td-123\n")
 	writeFile(t, filepath.Join(worker, "response_id"), "opaque-secret-id\n")
-	writeFile(t, filepath.Join(worktree, "graphify-out", "GRAPH_REPORT.md"), "# report\n")
-	writeFile(t, filepath.Join(worktree, "graphify-out", ".needs_update"), "")
+	writeFile(t, filepath.Join(worktree, "graphify-out", "GRAPH_REPORT.md"), "# Collector graph\ntoken=graph-secret\n")
 
 	runner := func(_ context.Context, dir, name string, args ...string) ([]byte, error) {
 		if dir != worktree {
@@ -382,9 +385,11 @@ func TestCollectorEnrichesWorkerWithReadOnlyDeliveryMetadata(t *testing.T) {
 		}
 		switch name {
 		case "gh":
-			return []byte(`{"url":"https://github.com/acme/api/pull/7","state":"OPEN","statusCheckRollup":[{"name":"test","status":"COMPLETED","conclusion":"SUCCESS"},{"context":"legacy-ci","state":"PENDING"}]}`), nil
+			return []byte(`{"url":"https://github.com/acme/api/pull/7","state":"OPEN","statusCheckRollup":[{"name":"test","status":"COMPLETED","conclusion":"SUCCESS"},{"context":"legacy-ci","state":"PENDING"}],"comments":[{"author":{"login":"reviewer"},"body":"ship it; password=private","url":"https://github.com/acme/api/pull/7#issuecomment-1"}]}`), nil
 		case "no-mistakes":
 			return []byte("run 42 review running token=unrecognized-secret\n"), nil
+		case "td":
+			return []byte("td-123: Dashboard\nCOMMENT: rollout approved\nAuthorization: Bearer td-secret\n"), nil
 		default:
 			t.Fatalf("unexpected probe: %s %v", name, args)
 			return nil, nil
@@ -396,15 +401,54 @@ func TestCollectorEnrichesWorkerWithReadOnlyDeliveryMetadata(t *testing.T) {
 	if got.PullRequest.URL != "https://github.com/acme/api/pull/7" || got.PullRequest.Checks[0].Conclusion != "SUCCESS" || got.PullRequest.Checks[1].State != "PENDING" {
 		t.Fatalf("pull request = %#v", got.PullRequest)
 	}
+	if got.Repository != "acme/api" {
+		t.Fatalf("repository = %q, want configured identity", got.Repository)
+	}
 	if !got.NoMistakes.Available || got.NoMistakes.Phase != "review" {
 		t.Fatalf("no-mistakes = %#v", got.NoMistakes)
 	}
-	if !got.Graphify.Present || got.Graphify.Summary != "update pending" || !got.OCInject.ResponsePending {
+	if !strings.Contains(got.NoMistakes.Summary, "run 42 review running token=[REDACTED]") || !strings.Contains(got.TD.Summary, "COMMENT: rollout approved") || strings.Contains(got.TD.Summary, "td-secret") {
+		t.Fatalf("td/no-mistakes details = %#v / %#v", got.TD, got.NoMistakes)
+	}
+	if len(got.PullRequest.Comments) != 1 || strings.Contains(got.PullRequest.Comments[0].Body, "private") {
+		t.Fatalf("pull request comments = %#v", got.PullRequest.Comments)
+	}
+	if !got.Graphify.Present || !strings.Contains(got.Graphify.Summary, "# Collector graph") || strings.Contains(got.Graphify.Summary, "graph-secret") || !got.OCInject.ResponsePending {
 		t.Fatalf("graphify/oc-inject = %#v / %#v", got.Graphify, got.OCInject)
 	}
-	serialized := dashboard.MustJSON(state)
+	serialized := mustJSON(t, state)
 	if strings.Contains(serialized, "opaque-secret-id") || strings.Contains(serialized, "unrecognized-secret") {
 		t.Fatal("opaque source data was exposed")
+	}
+}
+
+func TestCollectorReportsUnavailableCorruptAndOversizedSourcesTruthfully(t *testing.T) {
+	root := t.TempDir()
+	worker := filepath.Join(root, "task-123", "api")
+	worktree := filepath.Join(root, "worktree")
+	mustMkdirAll(t, worker)
+	mustMkdirAll(t, filepath.Join(worktree, "graphify-out"))
+	writeFile(t, filepath.Join(worker, "status"), "in_progress\n")
+	writeFile(t, filepath.Join(worker, "worktree"), worktree+"\n")
+	writeFile(t, filepath.Join(worker, "td_task"), "td-123\n")
+	writeFile(t, filepath.Join(worktree, "graphify-out", "GRAPH_REPORT.md"), strings.Repeat("x", (64<<10)+1))
+
+	runner := func(_ context.Context, _ string, name string, _ ...string) ([]byte, error) {
+		switch name {
+		case "gh":
+			return []byte(`{"url":`), nil
+		case "no-mistakes":
+			return []byte(strings.Repeat("x", (64<<10)+1)), nil
+		case "td":
+			return []byte(" \n"), nil
+		default:
+			return nil, fmt.Errorf("unexpected probe %s", name)
+		}
+	}
+
+	got := dashboard.Collector{FleetRoot: root, Run: runner}.Collect(t.Context()).Workers[0]
+	if got.PullRequest.Status != "corrupt" || got.NoMistakes.Status != "oversized" || got.TD.Status != "corrupt" || got.TD.Summary != "[content unavailable: corrupt]" || got.Graphify.Status != "oversized" {
+		t.Fatalf("degraded statuses = PR %q, no-mistakes %q, td %q, Graphify %q", got.PullRequest.Status, got.NoMistakes.Status, got.TD.Status, got.Graphify.Status)
 	}
 }
 
@@ -466,29 +510,81 @@ func TestCollectorPreservesOCInjectMetadataForNonEnrichableWorkers(t *testing.T)
 	if got := probes.Load(); got != 0 {
 		t.Fatalf("probes for non-enrichable workers = %d, want 0", got)
 	}
-	serialized := dashboard.MustJSON(state)
+	serialized := mustJSON(t, state)
 	if strings.Contains(serialized, "private-response-id") || strings.Contains(serialized, "private-response-ack") {
 		t.Fatal("oc-inject response body was exposed")
 	}
 }
 
 func TestRedactMetadataIsDeterministicAndRemovesSecrets(t *testing.T) {
-	input := map[string]any{
-		"event":         "inject",
-		"token":         "ghp_abcdefghijklmnopqrstuvwxyz0123456789",
-		"Authorization": "Bearer super-secret",
-		"detail":        "password=hunter2 safe-tail",
-		"nested":        map[string]any{"prompt": "do not expose", "count": float64(2)},
-	}
-	want := `{"Authorization":"[REDACTED]","detail":"password=[REDACTED] safe-tail","event":"inject","nested":{"count":2,"prompt":"[REDACTED]"},"token":"[REDACTED]"}`
-	first := dashboard.MustJSON(dashboard.RedactMetadata(input))
-	second := dashboard.MustJSON(dashboard.RedactMetadata(input))
+	input := `{"Authorization":"Bearer super-secret","detail":"password=hunter2 safe-tail","event":"inject","nested":{"count":2,"prompt":"do not expose"},"token":"ghp_abcdefghijklmnopqrstuvwxyz0123456789"}`
+	want := `{"Authorization":"[REDACTED]","detail":"password=[REDACTED]","event":"inject","nested":{"count":2,"prompt":"[REDACTED]"},"token":"[REDACTED]"}`
+	first := dashboard.RedactText(input)
+	second := dashboard.RedactText(input)
 	if first != want || second != want {
 		t.Fatalf("redacted metadata = %s / %s, want %s", first, second, want)
 	}
 }
 
-func TestCollectorProjectsFleetWithoutReadingSensitiveBodies(t *testing.T) {
+func TestRedactMetadataHandlesAdversarialOperationalText(t *testing.T) {
+	input := strings.Join([]string{
+		"ordinary deployment prose remains useful",
+		`API_TOKEN="line one`,
+		`line two"`,
+		"remote=https://operator:password@example.com/repository",
+		"token-remote=https://opaque-token@example.com/repository",
+		"database=postgres://operator:password@example.com/repository",
+		`note password="correct horse battery staple"`,
+		"GITHUB_TOKEN=github_pat_abcdefghijklmnopqrstuvwxyz0123456789",
+		"Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.payload.signature",
+		"authorization=Basic dXNlcjpwYXNzd29yZA==",
+		"inline Basic dXNlcjpwYXNzd29yZA== credential",
+		"-----BEGIN PRIVATE KEY-----",
+		"private-key-material",
+		"-----END PRIVATE KEY-----",
+		`password="quoted value with spaces"`,
+		"AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE",
+		"SLACK_TOKEN=xoxb-123456789012345678901234",
+		"control:\x00byte",
+	}, "\n")
+	redacted := dashboard.RedactText(input)
+	for _, secret := range []string{"line one", "line two", "operator:password", "opaque-token", "correct horse", "dXNlcjpwYXNzd29yZA", "private-key-material", "github_pat_", "eyJhbGci", "quoted value", "AKIAIOSFODNN7EXAMPLE", "xoxb-", "\x00"} {
+		if strings.Contains(redacted, secret) {
+			t.Errorf("redacted text retained %q: %q", secret, redacted)
+		}
+	}
+	for _, useful := range []string{"ordinary deployment prose remains useful", "remote=https://[REDACTED]@example.com/repository", "API_TOKEN=[REDACTED]", "control:byte"} {
+		if !strings.Contains(redacted, useful) {
+			t.Errorf("redacted text omitted %q: %q", useful, redacted)
+		}
+	}
+	if redacted != dashboard.RedactText(input) {
+		t.Fatal("redaction is not deterministic")
+	}
+	jsonEnvironment := `{"PATH":"/usr/bin","API_TOKEN":"opaque-json-secret","DATABASE_URL":"postgres://user:password@db/internal"}`
+	redactedEnvironment := dashboard.RedactText(jsonEnvironment)
+	if strings.Contains(redactedEnvironment, "opaque-json-secret") || strings.Contains(redactedEnvironment, "user:password") || !strings.Contains(redactedEnvironment, `"PATH":"/usr/bin"`) {
+		t.Fatalf("redacted JSON environment = %s", redactedEnvironment)
+	}
+	nestedEnvironment := dashboard.RedactText(`{"environment":{"PATH":"/usr/bin","TOKEN":"nested-secret"}}`)
+	if strings.Contains(nestedEnvironment, "nested-secret") || !strings.Contains(nestedEnvironment, `"PATH":"/usr/bin"`) {
+		t.Fatalf("redacted nested environment = %s", nestedEnvironment)
+	}
+	ordinaryFields := dashboard.RedactText(`{"compass":"north","message":"deployment complete","body":"ordinary prose"}`)
+	for _, useful := range []string{"north", "deployment complete", "ordinary prose"} {
+		if !strings.Contains(ordinaryFields, useful) {
+			t.Fatalf("redaction erased ordinary field %q: %s", useful, ordinaryFields)
+		}
+	}
+	camelCaseSecrets := dashboard.RedactText(`{"accessToken":"opaque-access","clientSecret":"opaque-client","apiKey":"opaque-api","refreshToken":"opaque-refresh","githubToken":"opaque-github","dbPassword":"opaque-db"}`)
+	for _, secret := range []string{"opaque-access", "opaque-client", "opaque-api", "opaque-refresh", "opaque-github", "opaque-db"} {
+		if strings.Contains(camelCaseSecrets, secret) {
+			t.Fatalf("camelCase secret %q was exposed: %s", secret, camelCaseSecrets)
+		}
+	}
+}
+
+func TestCollectorProjectsBoundedOperationalFilesWithoutReadingPromptOrResponseBodies(t *testing.T) {
 	root := t.TempDir()
 	worker := filepath.Join(root, "task-123", "api")
 	worktree := filepath.Join(root, "worktree")
@@ -500,7 +596,12 @@ func TestCollectorProjectsFleetWithoutReadingSensitiveBodies(t *testing.T) {
 	writeFile(t, filepath.Join(worker, "td_task"), "td-123\n")
 	writeFile(t, filepath.Join(worker, "worktree"), worktree+"\n")
 	writeFile(t, filepath.Join(worker, "message"), "Approval required; password=hunter2\n")
+	writeFile(t, filepath.Join(worker, "diagnostic"), "collection delayed; retry safe\n")
+	writeFile(t, filepath.Join(worker, "worker.log"), "tests passed; token=private-token\n")
+	writeFile(t, filepath.Join(worker, "handoff"), "remaining: open PR\n")
 	writeFile(t, filepath.Join(worker, "initial_message"), "SECRET_PROMPT_BODY\n")
+	writeFile(t, filepath.Join(worker, "response"), "SECRET_RESPONSE_BODY\n")
+	writeFile(t, filepath.Join(worktree, ".env"), "REPOSITORY_SECRET=do-not-read\n")
 
 	now := time.Date(2026, 7, 21, 12, 0, 0, 0, time.UTC)
 	setModTime(t, filepath.Join(worker, "status"), now.Add(-time.Minute))
@@ -522,12 +623,31 @@ func TestCollectorProjectsFleetWithoutReadingSensitiveBodies(t *testing.T) {
 	if !got.Message.Present || !got.Message.UpdatedAt.Equal(now.Add(-30*time.Second)) {
 		t.Fatalf("message metadata = %#v", got.Message)
 	}
-	if got.Message.Summary != "" {
-		t.Fatalf("message body was projected: %q", got.Message.Summary)
+	if got.Message.Summary != "Approval required; password=[REDACTED]" || got.Diagnostic.Summary != "collection delayed; retry safe" ||
+		got.Log.Summary != "tests passed; token=[REDACTED]" || got.Handoff.Summary != "remaining: open PR" {
+		t.Fatalf("operational files = %#v / %#v / %#v / %#v", got.Message, got.Diagnostic, got.Log, got.Handoff)
 	}
-	serialized := dashboard.MustJSON(state)
-	if strings.Contains(serialized, "Approval required") || strings.Contains(serialized, "hunter2") || strings.Contains(serialized, "SECRET_PROMPT_BODY") {
+	serialized := mustJSON(t, state)
+	if strings.Contains(serialized, "hunter2") || strings.Contains(serialized, "SECRET_PROMPT_BODY") || strings.Contains(serialized, "SECRET_RESPONSE_BODY") || strings.Contains(serialized, "do-not-read") {
 		t.Fatalf("state exposed a sensitive body: %s", serialized)
+	}
+}
+
+func TestCollectorReportsExistingInvalidOperationalFile(t *testing.T) {
+	root := t.TempDir()
+	worker := filepath.Join(root, "task-123", "api")
+	mustMkdirAll(t, worker)
+	writeFile(t, filepath.Join(worker, "status"), "orphaned\n")
+	mustMkdirAll(t, filepath.Join(worker, "message"))
+	writeFile(t, filepath.Join(worker, "diagnostic"), "")
+
+	workerState := dashboard.Collector{FleetRoot: root}.Collect(t.Context()).Workers[0]
+	message := workerState.Message
+	if !message.Present || message.Status != "corrupt" {
+		t.Fatalf("invalid operational file = %#v, want present corrupt status", message)
+	}
+	if !workerState.Diagnostic.Present || workerState.Diagnostic.Status != "corrupt" {
+		t.Fatalf("empty operational file = %#v, want present corrupt status", workerState.Diagnostic)
 	}
 }
 
@@ -658,9 +778,18 @@ func TestCollectorClassifiesLifecycleValues(t *testing.T) {
 			t.Errorf("%s lifecycle = status %q health %q, want %q/%q", test.name, worker.Status, worker.Health, test.wantStatus, test.wantHealth)
 		}
 	}
-	if serialized := dashboard.MustJSON(state.Warnings); strings.Contains(serialized, "credential=hunter2") || strings.Contains(serialized, strings.Repeat("x", 100)) {
+	if serialized := mustJSON(t, state.Warnings); strings.Contains(serialized, "credential=hunter2") || strings.Contains(serialized, strings.Repeat("x", 100)) {
 		t.Fatalf("warnings exposed raw corrupt lifecycle values: %s", serialized)
 	}
+}
+
+func mustJSON(t *testing.T, value any) string {
+	t.Helper()
+	data, err := json.Marshal(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(data)
 }
 
 func TestCollectorToleratesMissingFleetRoot(t *testing.T) {
