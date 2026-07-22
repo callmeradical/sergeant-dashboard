@@ -181,11 +181,10 @@ func (c Collector) enrichWorkers(ctx context.Context, workers []Worker) {
 
 func (c Collector) enrichWorker(parent context.Context, worker *Worker) {
 	worker.PullRequest.Checks = []Check{}
-	if !worker.enrichable {
-		return
+	pending := FileMetadata{}
+	if worker.Worktree != "" {
+		pending = fileMetadata(filepath.Join(filepath.Dir(worker.Worktree), "response_id"))
 	}
-	worker.Graphify = graphifyMetadata(worker.Worktree)
-	pending := fileMetadata(filepath.Join(filepath.Dir(worker.Worktree), "response_id"))
 	// Current Sergeant workers keep transport metadata beside their scalar state,
 	// not necessarily in the worktree.
 	if !pending.Present {
@@ -193,6 +192,10 @@ func (c Collector) enrichWorker(parent context.Context, worker *Worker) {
 	}
 	acked := fileMetadata(filepath.Join(c.FleetRoot, worker.Task, worker.Project, "response_ack"))
 	worker.OCInject = AuditMetadata{ResponsePending: pending.Present, ResponseAcked: acked.Present, UpdatedAt: latestTime(pending.UpdatedAt, acked.UpdatedAt)}
+	if !worker.enrichable {
+		return
+	}
+	worker.Graphify = graphifyMetadata(worker.Worktree)
 
 	run := c.Run
 	if run == nil {

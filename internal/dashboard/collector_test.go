@@ -408,6 +408,64 @@ func TestCollectorEnrichesWorkerWithReadOnlyDeliveryMetadata(t *testing.T) {
 	}
 }
 
+func TestCollectorPreservesOCInjectMetadataForNonEnrichableWorkers(t *testing.T) {
+	root := t.TempDir()
+	now := time.Date(2026, 7, 22, 12, 0, 0, 0, time.UTC)
+	tests := []struct {
+		name       string
+		status     string
+		worktree   string
+		wantHealth string
+	}{
+		{name: "active", status: "in_progress", wantHealth: "active"},
+		{name: "terminal", status: "done", worktree: filepath.Join(root, "removed-terminal"), wantHealth: "complete"},
+		{name: "unknown", status: "invalid", worktree: filepath.Join(root, "removed-unknown"), wantHealth: "unknown"},
+		{name: "orphaned", status: "orphaned", worktree: filepath.Join(root, "removed-orphaned"), wantHealth: "orphaned"},
+	}
+	for _, test := range tests {
+		worker := filepath.Join(root, test.name, "api")
+		mustMkdirAll(t, worker)
+		writeFile(t, filepath.Join(worker, "status"), test.status+"\n")
+		if test.worktree != "" {
+			writeFile(t, filepath.Join(worker, "worktree"), test.worktree+"\n")
+		}
+		writeFile(t, filepath.Join(worker, "response_id"), "private-response-id\n")
+		writeFile(t, filepath.Join(worker, "response_ack"), "private-response-ack\n")
+		setModTime(t, filepath.Join(worker, "response_id"), now.Add(-time.Minute))
+		setModTime(t, filepath.Join(worker, "response_ack"), now)
+	}
+
+	var probes atomic.Int32
+	state := dashboard.Collector{
+		FleetRoot: root,
+		Run: func(context.Context, string, string, ...string) ([]byte, error) {
+			probes.Add(1)
+			return nil, nil
+		},
+	}.Collect(t.Context())
+
+	byTask := make(map[string]dashboard.Worker, len(state.Workers))
+	for _, worker := range state.Workers {
+		byTask[worker.Task] = worker
+	}
+	for _, test := range tests {
+		got := byTask[test.name]
+		if got.Health != test.wantHealth {
+			t.Errorf("%s health = %q, want %q", test.name, got.Health, test.wantHealth)
+		}
+		if !got.OCInject.ResponsePending || !got.OCInject.ResponseAcked || !got.OCInject.UpdatedAt.Equal(now) {
+			t.Errorf("%s oc-inject metadata = %#v", test.name, got.OCInject)
+		}
+	}
+	if got := probes.Load(); got != 0 {
+		t.Fatalf("probes for non-enrichable workers = %d, want 0", got)
+	}
+	serialized := dashboard.MustJSON(state)
+	if strings.Contains(serialized, "private-response-id") || strings.Contains(serialized, "private-response-ack") {
+		t.Fatal("oc-inject response body was exposed")
+	}
+}
+
 func TestRedactMetadataIsDeterministicAndRemovesSecrets(t *testing.T) {
 	input := map[string]any{
 		"event":         "inject",
