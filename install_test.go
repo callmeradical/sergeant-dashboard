@@ -134,6 +134,43 @@ exit 0
 	runScript(t, env, "scripts/uninstall.sh")
 }
 
+func TestUninstallPreservesArtifactsWhenInactivityCannotBeVerified(t *testing.T) {
+	home := t.TempDir()
+	mocks := filepath.Join(t.TempDir(), "bin")
+	mustMkdir(t, mocks)
+	writeExecutable(t, filepath.Join(mocks, "systemctl"), `#!/bin/sh
+case "$*" in
+  "--user disable --now sergeant-dashboard.service") exit 1 ;;
+  "--user is-active --quiet sergeant-dashboard.service") exit 1 ;;
+esac
+exit 0
+`)
+	binary := filepath.Join(home, ".local", "bin", "sergeant-dashboard")
+	unit := filepath.Join(home, "config", "systemd", "user", "sergeant-dashboard.service")
+	mustMkdir(t, filepath.Dir(binary))
+	mustMkdir(t, filepath.Dir(unit))
+	writeExecutable(t, binary, "#!/bin/sh\n")
+	if err := os.WriteFile(unit, []byte("[Service]\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	command := exec.Command("sh", "scripts/uninstall.sh")
+	command.Env = append(os.Environ(),
+		"HOME="+home,
+		"XDG_CONFIG_HOME="+filepath.Join(home, "config"),
+		"PATH="+mocks+":/usr/bin:/bin",
+	)
+	output, err := command.CombinedOutput()
+	if err == nil || strings.Contains(string(output), "Uninstalled") {
+		t.Fatalf("uninstall did not fail truthfully when inactivity was unknown: err=%v output=%s", err, output)
+	}
+	for _, path := range []string{binary, unit} {
+		if _, statErr := os.Stat(path); statErr != nil {
+			t.Errorf("uninstall removed recovery artifact %s: %v", path, statErr)
+		}
+	}
+}
+
 func TestDocumentationCoversServeValidationAndRollback(t *testing.T) {
 	readme, err := os.ReadFile("README.md")
 	if err != nil {
