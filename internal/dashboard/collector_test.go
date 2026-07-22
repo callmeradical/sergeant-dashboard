@@ -94,7 +94,9 @@ func TestCollectorBoundsDegradedFleetLatency(t *testing.T) {
 	}
 
 	var active atomic.Int32
+	var startedProbes atomic.Int32
 	runner := func(ctx context.Context, _ string, _ string, _ ...string) ([]byte, error) {
+		startedProbes.Add(1)
 		active.Add(1)
 		defer active.Add(-1)
 		<-ctx.Done()
@@ -108,6 +110,9 @@ func TestCollectorBoundsDegradedFleetLatency(t *testing.T) {
 
 	if len(state.Workers) != workerCount {
 		t.Fatalf("workers = %d, want complete %d-worker projection", len(state.Workers), workerCount)
+	}
+	if got, want := startedProbes.Load(), int32(2*workerCount); got != want {
+		t.Fatalf("started probes = %d, want complete enrichment with %d probes", got, want)
 	}
 	if elapsed >= 5*probeTimeout {
 		t.Fatalf("degraded collection took %v, want less than %v", elapsed, 5*probeTimeout)
@@ -131,9 +136,17 @@ func TestCollectorBoundsGoroutinesIndependentlyOfFleetSize(t *testing.T) {
 	release := make(chan struct{})
 	ready := make(chan struct{})
 	var active atomic.Int32
+	var maximum atomic.Int32
 	var once sync.Once
 	runner := func(ctx context.Context, _ string, _ string, _ ...string) ([]byte, error) {
-		if active.Add(1) == 16 {
+		now := active.Add(1)
+		for {
+			old := maximum.Load()
+			if now <= old || maximum.CompareAndSwap(old, now) {
+				break
+			}
+		}
+		if now == 16 {
 			once.Do(func() { close(ready) })
 		}
 		defer active.Add(-1)
@@ -181,8 +194,59 @@ measure:
 	if maximumGrowth > 40 {
 		t.Fatalf("goroutine growth = %d, want at most 40 independently of fleet size", maximumGrowth)
 	}
+	if got := maximum.Load(); got > 16 {
+		t.Fatalf("maximum active probes = %d, want at most 16", got)
+	}
 	if got := active.Load(); got != 0 {
 		t.Fatalf("active probes after collection = %d, want 0", got)
+	}
+}
+
+func TestCollectorCancellationReleasesProbes(t *testing.T) {
+	root := t.TempDir()
+	for index := 0; index < 8; index++ {
+		worker := filepath.Join(root, fmt.Sprintf("task-%02d", index), "api")
+		worktree := filepath.Join(root, fmt.Sprintf("worktree-%02d", index))
+		mustMkdirAll(t, worker)
+		mustMkdirAll(t, worktree)
+		writeFile(t, filepath.Join(worker, "status"), "in_progress\n")
+		writeFile(t, filepath.Join(worker, "worktree"), worktree+"\n")
+	}
+
+	ready := make(chan struct{})
+	var active atomic.Int32
+	var once sync.Once
+	runner := func(ctx context.Context, _ string, _ string, _ ...string) ([]byte, error) {
+		if active.Add(1) == 16 {
+			once.Do(func() { close(ready) })
+		}
+		defer active.Add(-1)
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan dashboard.State, 1)
+	go func() {
+		done <- dashboard.Collector{FleetRoot: root, Run: runner, ProbeTimeout: time.Second}.Collect(ctx)
+	}()
+	select {
+	case <-ready:
+	case <-time.After(time.Second):
+		cancel()
+		t.Fatal("collector did not start all probes")
+	}
+	cancel()
+	select {
+	case state := <-done:
+		if len(state.Workers) != 8 {
+			t.Fatalf("workers = %d, want complete 8-worker projection", len(state.Workers))
+		}
+	case <-time.After(time.Second):
+		t.Fatal("collector did not return after cancellation")
+	}
+	if got := active.Load(); got != 0 {
+		t.Fatalf("active probes after cancellation = %d, want 0", got)
 	}
 }
 

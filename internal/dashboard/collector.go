@@ -134,12 +134,16 @@ func (c Collector) enrichWorkers(ctx context.Context, workers []Worker) {
 	if probeTimeout <= 0 {
 		probeTimeout = 3 * time.Second
 	}
-	enrichmentTime := maxEnrichmentBatches * probeTimeout
-	if enrichmentTime > maxEnrichmentTime {
-		enrichmentTime = maxEnrichmentTime
+	enrichmentTime := maxEnrichmentTime
+	if probeTimeout <= maxEnrichmentTime/maxEnrichmentBatches {
+		enrichmentTime = maxEnrichmentBatches * probeTimeout
 	}
-	enrichmentCtx, cancel := context.WithTimeout(ctx, enrichmentTime)
-	defer cancel()
+	batchCount := (len(workers) + maxConcurrentWorkers - 1) / maxConcurrentWorkers
+	if batchCount > 0 {
+		probeTimeout = min(probeTimeout, enrichmentTime/time.Duration(batchCount))
+	}
+	probeCollector := c
+	probeCollector.ProbeTimeout = probeTimeout
 
 	workerCount := min(maxConcurrentWorkers, len(workers))
 	jobs := make(chan *Worker)
@@ -149,14 +153,14 @@ func (c Collector) enrichWorkers(ctx context.Context, workers []Worker) {
 		go func() {
 			defer wait.Done()
 			for worker := range jobs {
-				c.enrichWorker(enrichmentCtx, worker)
+				probeCollector.enrichWorker(ctx, worker)
 			}
 		}()
 	}
 	for index := range workers {
 		select {
 		case jobs <- &workers[index]:
-		case <-enrichmentCtx.Done():
+		case <-ctx.Done():
 			close(jobs)
 			wait.Wait()
 			return
