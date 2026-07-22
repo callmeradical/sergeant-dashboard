@@ -228,8 +228,10 @@ func collectWorker(dir, task, project string, now time.Time, staleAfter time.Dur
 	warnings := []string{}
 	var err error
 	worker.Status, worker.UpdatedAt, err = readScalarWithTime(filepath.Join(dir, "status"))
-	if err != nil {
+	if err != nil || !isLifecycle(worker.Status) {
 		warnings = append(warnings, fmt.Sprintf("worker %s/%s has invalid status", task, project))
+		worker.Status = "unknown"
+		worker.Health = "unknown"
 	}
 	worker.Agent, _, _ = readScalarWithTime(filepath.Join(dir, "agent"))
 	worker.Branch, _, _ = readScalarWithTime(filepath.Join(dir, "branch"))
@@ -237,6 +239,9 @@ func collectWorker(dir, task, project string, now time.Time, staleAfter time.Dur
 	worker.Worktree, _, _ = readScalarWithTime(filepath.Join(dir, "worktree"))
 	worker.Message = fileMetadata(filepath.Join(dir, "message"))
 
+	if worker.Status == "unknown" {
+		return worker, warnings
+	}
 	if worker.Status == "orphaned" {
 		return worker, warnings
 	}
@@ -294,6 +299,10 @@ func graphifyMetadata(worktree string) FileMetadata {
 
 func isTerminal(status string) bool {
 	return status == "done" || status == "failed" || strings.HasPrefix(status, "failed:")
+}
+
+func isLifecycle(status string) bool {
+	return status == "in_progress" || status == "needs_input" || status == "blocked" || status == "orphaned" || isTerminal(status)
 }
 
 func latestTime(left, right time.Time) time.Time {

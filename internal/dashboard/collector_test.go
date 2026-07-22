@@ -254,6 +254,50 @@ func TestCollectorClassifiesStaleOrphanedAndCorruptWorkers(t *testing.T) {
 	}
 }
 
+func TestCollectorClassifiesLifecycleValues(t *testing.T) {
+	root := t.TempDir()
+	now := time.Date(2026, 7, 21, 12, 0, 0, 0, time.UTC)
+	tests := []struct {
+		name       string
+		value      string
+		wantStatus string
+		wantHealth string
+	}{
+		{name: "in-progress", value: "in_progress", wantStatus: "in_progress", wantHealth: "active"},
+		{name: "needs-input", value: "needs_input", wantStatus: "needs_input", wantHealth: "active"},
+		{name: "blocked", value: "blocked", wantStatus: "blocked", wantHealth: "active"},
+		{name: "done", value: "done", wantStatus: "done", wantHealth: "complete"},
+		{name: "failed", value: "failed", wantStatus: "failed", wantHealth: "complete"},
+		{name: "failed-with-reason", value: "failed: command exited", wantStatus: "failed: command exited", wantHealth: "complete"},
+		{name: "orphaned", value: "orphaned", wantStatus: "orphaned", wantHealth: "orphaned"},
+		{name: "empty", value: "", wantStatus: "unknown", wantHealth: "unknown"},
+		{name: "unknown", value: "credential=hunter2", wantStatus: "unknown", wantHealth: "unknown"},
+		{name: "oversized", value: strings.Repeat("x", 5000), wantStatus: "unknown", wantHealth: "unknown"},
+	}
+
+	for _, test := range tests {
+		worker := filepath.Join(root, test.name, "api")
+		mustMkdirAll(t, worker)
+		writeFile(t, filepath.Join(worker, "status"), test.value+"\n")
+		setModTime(t, filepath.Join(worker, "status"), now.Add(-time.Minute))
+	}
+
+	state := dashboard.Collector{FleetRoot: root, Now: func() time.Time { return now }, StaleAfter: 15 * time.Minute}.Collect(t.Context())
+	byTask := make(map[string]dashboard.Worker, len(state.Workers))
+	for _, worker := range state.Workers {
+		byTask[worker.Task] = worker
+	}
+	for _, test := range tests {
+		worker := byTask[test.name]
+		if worker.Status != test.wantStatus || worker.Health != test.wantHealth {
+			t.Errorf("%s lifecycle = status %q health %q, want %q/%q", test.name, worker.Status, worker.Health, test.wantStatus, test.wantHealth)
+		}
+	}
+	if serialized := dashboard.MustJSON(state.Warnings); strings.Contains(serialized, "credential=hunter2") || strings.Contains(serialized, strings.Repeat("x", 100)) {
+		t.Fatalf("warnings exposed raw corrupt lifecycle values: %s", serialized)
+	}
+}
+
 func TestCollectorToleratesMissingFleetRoot(t *testing.T) {
 	state := dashboard.Collector{FleetRoot: filepath.Join(t.TempDir(), "missing")}.Collect(t.Context())
 	if state.Workers == nil || len(state.Warnings) != 1 {
