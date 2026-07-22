@@ -4,11 +4,13 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
 
 func TestInstallAndUninstallManageUserService(t *testing.T) {
+	requireLinux(t)
 	home := t.TempDir()
 	mocks := filepath.Join(t.TempDir(), "bin")
 	mustMkdir(t, mocks)
@@ -74,6 +76,7 @@ exit 1
 }
 
 func TestUninstallPreservesArtifactsWhenServiceCannotStop(t *testing.T) {
+	requireLinux(t)
 	home := t.TempDir()
 	mocks := filepath.Join(t.TempDir(), "bin")
 	mustMkdir(t, mocks)
@@ -115,6 +118,7 @@ exit 0
 }
 
 func TestUninstallToleratesMissingInactiveService(t *testing.T) {
+	requireLinux(t)
 	for name, status := range map[string]string{"inactive": "3", "missing": "4"} {
 		t.Run(name, func(t *testing.T) {
 			home := t.TempDir()
@@ -139,6 +143,7 @@ exit 0
 }
 
 func TestUninstallPreservesArtifactsWhenInactivityCannotBeVerified(t *testing.T) {
+	requireLinux(t)
 	home := t.TempDir()
 	mocks := filepath.Join(t.TempDir(), "bin")
 	mustMkdir(t, mocks)
@@ -273,6 +278,13 @@ func runScript(t *testing.T, env []string, path string) {
 	command.Env = env
 	if output, err := command.CombinedOutput(); err != nil {
 		t.Fatalf("%s: %v: %s", path, err, output)
+	}
+}
+
+func requireLinux(t *testing.T) {
+	t.Helper()
+	if runtime.GOOS != "linux" {
+		t.Skip("systemd lifecycle scripts support Linux only")
 	}
 }
 

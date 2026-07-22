@@ -415,12 +415,13 @@ func TestCollectorPreservesOCInjectMetadataForNonEnrichableWorkers(t *testing.T)
 		name       string
 		status     string
 		worktree   string
+		wantStatus string
 		wantHealth string
 	}{
-		{name: "active", status: "in_progress", wantHealth: "active"},
-		{name: "terminal", status: "done", worktree: filepath.Join(root, "removed-terminal"), wantHealth: "complete"},
-		{name: "unknown", status: "invalid", worktree: filepath.Join(root, "removed-unknown"), wantHealth: "unknown"},
-		{name: "orphaned", status: "orphaned", worktree: filepath.Join(root, "removed-orphaned"), wantHealth: "orphaned"},
+		{name: "active", status: "in_progress", wantStatus: "in_progress", wantHealth: "orphaned"},
+		{name: "terminal", status: "done", worktree: filepath.Join(root, "removed-terminal"), wantStatus: "done", wantHealth: "complete"},
+		{name: "unknown", status: "invalid", worktree: filepath.Join(root, "removed-unknown"), wantStatus: "unknown", wantHealth: "unknown"},
+		{name: "orphaned", status: "orphaned", worktree: filepath.Join(root, "removed-orphaned"), wantStatus: "orphaned", wantHealth: "orphaned"},
 	}
 	for _, test := range tests {
 		worker := filepath.Join(root, test.name, "api")
@@ -450,10 +451,15 @@ func TestCollectorPreservesOCInjectMetadataForNonEnrichableWorkers(t *testing.T)
 	}
 	for _, test := range tests {
 		got := byTask[test.name]
+		if got.Status != test.wantStatus {
+			t.Errorf("%s status = %q, want %q", test.name, got.Status, test.wantStatus)
+		}
 		if got.Health != test.wantHealth {
 			t.Errorf("%s health = %q, want %q", test.name, got.Health, test.wantHealth)
 		}
-		if !got.OCInject.ResponsePending || !got.OCInject.ResponseAcked || !got.OCInject.UpdatedAt.Equal(now) {
+		if !got.OCInject.ResponsePending || !got.OCInject.ResponseAcked ||
+			!got.OCInject.ResponsePendingAt.Equal(now.Add(-time.Minute)) ||
+			!got.OCInject.ResponseAckedAt.Equal(now) || !got.OCInject.UpdatedAt.Equal(now) {
 			t.Errorf("%s oc-inject metadata = %#v", test.name, got.OCInject)
 		}
 	}
@@ -605,6 +611,8 @@ func TestCollectorClassifiesTerminalWorkersCompleteAfterWorktreeCleanup(t *testi
 
 func TestCollectorClassifiesLifecycleValues(t *testing.T) {
 	root := t.TempDir()
+	worktree := filepath.Join(root, "worktree")
+	mustMkdirAll(t, worktree)
 	now := time.Date(2026, 7, 21, 12, 0, 0, 0, time.UTC)
 	tests := []struct {
 		name       string
@@ -628,10 +636,18 @@ func TestCollectorClassifiesLifecycleValues(t *testing.T) {
 		worker := filepath.Join(root, test.name, "api")
 		mustMkdirAll(t, worker)
 		writeFile(t, filepath.Join(worker, "status"), test.value+"\n")
+		if test.wantHealth == "active" {
+			writeFile(t, filepath.Join(worker, "worktree"), worktree+"\n")
+		}
 		setModTime(t, filepath.Join(worker, "status"), now.Add(-time.Minute))
 	}
 
-	state := dashboard.Collector{FleetRoot: root, Now: func() time.Time { return now }, StaleAfter: 15 * time.Minute}.Collect(t.Context())
+	state := dashboard.Collector{
+		FleetRoot:  root,
+		Now:        func() time.Time { return now },
+		StaleAfter: 15 * time.Minute,
+		Run:        func(context.Context, string, string, ...string) ([]byte, error) { return nil, nil },
+	}.Collect(t.Context())
 	byTask := make(map[string]dashboard.Worker, len(state.Workers))
 	for _, worker := range state.Workers {
 		byTask[worker.Task] = worker

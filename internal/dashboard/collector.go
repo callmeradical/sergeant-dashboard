@@ -83,9 +83,11 @@ type ToolStatus struct {
 }
 
 type AuditMetadata struct {
-	ResponsePending bool      `json:"responsePending"`
-	ResponseAcked   bool      `json:"responseAcked"`
-	UpdatedAt       time.Time `json:"updatedAt,omitempty"`
+	ResponsePending   bool      `json:"responsePending"`
+	ResponsePendingAt time.Time `json:"responsePendingAt,omitempty"`
+	ResponseAcked     bool      `json:"responseAcked"`
+	ResponseAckedAt   time.Time `json:"responseAckedAt,omitempty"`
+	UpdatedAt         time.Time `json:"updatedAt,omitempty"`
 }
 
 func (c Collector) Collect(ctx context.Context) State {
@@ -191,7 +193,13 @@ func (c Collector) enrichWorker(parent context.Context, worker *Worker) {
 		pending = fileMetadata(filepath.Join(c.FleetRoot, worker.Task, worker.Project, "response_id"))
 	}
 	acked := fileMetadata(filepath.Join(c.FleetRoot, worker.Task, worker.Project, "response_ack"))
-	worker.OCInject = AuditMetadata{ResponsePending: pending.Present, ResponseAcked: acked.Present, UpdatedAt: latestTime(pending.UpdatedAt, acked.UpdatedAt)}
+	worker.OCInject = AuditMetadata{
+		ResponsePending:   pending.Present,
+		ResponsePendingAt: pending.UpdatedAt,
+		ResponseAcked:     acked.Present,
+		ResponseAckedAt:   acked.UpdatedAt,
+		UpdatedAt:         latestTime(pending.UpdatedAt, acked.UpdatedAt),
+	}
 	if !worker.enrichable {
 		return
 	}
@@ -302,7 +310,7 @@ func collectWorker(dir, task, project string, now time.Time, staleAfter time.Dur
 		worker.Health = "complete"
 		return worker, warnings
 	}
-	if worker.Worktree != "" && !worker.enrichable {
+	if !worker.enrichable {
 		return worker, warnings
 	}
 	if !worker.UpdatedAt.IsZero() && now.Sub(worker.UpdatedAt) > staleAfter {
