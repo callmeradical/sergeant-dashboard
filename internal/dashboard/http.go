@@ -2,6 +2,8 @@ package dashboard
 
 import (
 	"context"
+	"crypto/hmac"
+	"crypto/rand"
 	"crypto/sha256"
 	"embed"
 	"encoding/json"
@@ -122,6 +124,7 @@ type projectedCheck struct {
 var (
 	tdTaskID = regexp.MustCompile(`^td-[A-Za-z0-9]+$`)
 	prPath   = regexp.MustCompile(`^/([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)/pull/([0-9]+)/?$`)
+	aliasKey = newAliasKey()
 )
 
 func projectState(state State) projectedState {
@@ -174,8 +177,17 @@ func projectState(state State) projectedState {
 }
 
 func opaqueLabel(kind, value string) string {
-	digest := sha256.Sum256([]byte(value))
-	return fmt.Sprintf("%s-%x", kind, digest[:6])
+	digest := hmac.New(sha256.New, aliasKey)
+	_, _ = digest.Write([]byte(value))
+	return fmt.Sprintf("%s-%x", kind, digest.Sum(nil)[:6])
+}
+
+func newAliasKey() []byte {
+	key := make([]byte, 32)
+	if _, err := rand.Read(key); err != nil {
+		panic(fmt.Sprintf("generate alias key: %v", err))
+	}
+	return key
 }
 
 func allowEnum(value, fallback string, allowed ...string) string {

@@ -3,6 +3,7 @@ package dashboard_test
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -81,10 +82,7 @@ func TestStateAPIBoundsProbeConcurrencyAcrossRequests(t *testing.T) {
 
 	var active atomic.Int32
 	var maximum atomic.Int32
-	ready := make(chan struct{})
-	release := make(chan struct{})
-	var once sync.Once
-	runner := func(ctx context.Context, _ string, _ string, _ ...string) ([]byte, error) {
+	runner := func(ctx context.Context, _ string, name string, _ ...string) ([]byte, error) {
 		now := active.Add(1)
 		defer active.Add(-1)
 		for {
@@ -93,38 +91,41 @@ func TestStateAPIBoundsProbeConcurrencyAcrossRequests(t *testing.T) {
 				break
 			}
 		}
-		if now == 16 {
-			once.Do(func() { close(ready) })
-		}
 		select {
-		case <-release:
-			return []byte(`{}`), nil
+		case <-time.After(100 * time.Millisecond):
+			if name == "no-mistakes" {
+				return []byte("review"), nil
+			}
+			return []byte(`{"url":"https://github.com/acme/api/pull/7","state":"OPEN"}`), nil
 		case <-ctx.Done():
 			return nil, ctx.Err()
 		}
 	}
 
-	handler := dashboard.NewHandler(dashboard.Collector{FleetRoot: root, Run: runner, ProbeTimeout: time.Second})
+	handler := dashboard.NewHandler(dashboard.Collector{FleetRoot: root, Run: runner, ProbeTimeout: 150 * time.Millisecond})
 	var requests sync.WaitGroup
+	responses := make(chan *httptest.ResponseRecorder, 2)
 	requests.Add(2)
 	for range 2 {
 		go func() {
 			defer requests.Done()
-			request(t, handler, http.MethodGet, "/sergeant/api/state")
+			responses <- request(t, handler, http.MethodGet, "/sergeant/api/state")
 		}()
 	}
-	select {
-	case <-ready:
-	case <-time.After(time.Second):
-		close(release)
-		t.Fatal("concurrent requests did not start 16 probes")
-	}
-	time.Sleep(25 * time.Millisecond)
-	close(release)
 	requests.Wait()
+	close(responses)
 
 	if got := maximum.Load(); got > 16 {
 		t.Fatalf("maximum active probes across requests = %d, want at most 16", got)
+	}
+	for response := range responses {
+		body := response.Body.String()
+		if got := strings.Count(body, `"url":"https://github.com/acme/api/pull/7"`); got != 8 {
+			t.Errorf("complete pull request projections = %d, want 8: %s", got, body)
+		}
+		if got := strings.Count(body, `"available":true`); got != 8 {
+			t.Errorf("complete no-mistakes projections = %d, want 8: %s", got, body)
+		}
 	}
 }
 
@@ -168,6 +169,19 @@ func TestStateAPIProjectsOnlyAllowlistedMetadata(t *testing.T) {
 	} {
 		if !strings.Contains(body, allowed) {
 			t.Errorf("state API omitted allowlisted value %q: %s", allowed, body)
+		}
+	}
+}
+
+func TestStateAPIAliasesAreNotRecoverableUnsaltedHashes(t *testing.T) {
+	state := dashboard.State{Workers: []dashboard.Worker{{Task: "api", Project: "web", Health: "active"}}}
+	response := request(t, dashboard.NewHandler(fixedSource{state: state}), http.MethodGet, "/sergeant/api/state")
+	body := response.Body.String()
+	for kind, value := range map[string]string{"task": "api", "project": "web"} {
+		digest := sha256.Sum256([]byte(value))
+		predictable := fmt.Sprintf("%s-%x", kind, digest[:6])
+		if strings.Contains(body, predictable) {
+			t.Errorf("state API exposed predictable alias %q", predictable)
 		}
 	}
 }

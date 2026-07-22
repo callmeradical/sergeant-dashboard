@@ -204,9 +204,7 @@ func (c Collector) enrichWorker(parent context.Context, worker *Worker) {
 	pullRequest := make(chan PullRequest, 1)
 	go func() {
 		result := PullRequest{Checks: []Check{}}
-		githubCtx, cancelGitHub := context.WithTimeout(parent, timeout)
-		defer cancelGitHub()
-		output, err := runLimitedProbe(githubCtx, run, worker.Worktree, "gh", "pr", "view", "--json", "url,state,statusCheckRollup")
+		output, err := runLimitedProbe(parent, timeout, run, worker.Worktree, "gh", "pr", "view", "--json", "url,state,statusCheckRollup")
 		if err == nil && len(output) <= 1<<20 {
 			var response struct {
 				URL               string  `json:"url"`
@@ -225,9 +223,7 @@ func (c Collector) enrichWorker(parent context.Context, worker *Worker) {
 	noMistakes := make(chan ToolStatus, 1)
 	go func() {
 		result := ToolStatus{}
-		noMistakesCtx, cancelNoMistakes := context.WithTimeout(parent, timeout)
-		defer cancelNoMistakes()
-		output, err := runLimitedProbe(noMistakesCtx, run, worker.Worktree, "no-mistakes", "runs", "--limit", "1")
+		output, err := runLimitedProbe(parent, timeout, run, worker.Worktree, "no-mistakes", "runs", "--limit", "1")
 		if err == nil {
 			result = ToolStatus{Available: true, Phase: noMistakesPhase(output)}
 		}
@@ -237,13 +233,15 @@ func (c Collector) enrichWorker(parent context.Context, worker *Worker) {
 	worker.NoMistakes = <-noMistakes
 }
 
-func runLimitedProbe(ctx context.Context, run Runner, dir, name string, args ...string) ([]byte, error) {
+func runLimitedProbe(parent context.Context, timeout time.Duration, run Runner, dir, name string, args ...string) ([]byte, error) {
 	select {
 	case processProbeSlots <- struct{}{}:
 		defer func() { <-processProbeSlots }()
+		ctx, cancel := context.WithTimeout(parent, timeout)
+		defer cancel()
 		return run(ctx, dir, name, args...)
-	case <-ctx.Done():
-		return nil, ctx.Err()
+	case <-parent.Done():
+		return nil, parent.Err()
 	}
 }
 
