@@ -55,6 +55,64 @@ func TestCollectorProbesWorkersConcurrently(t *testing.T) {
 	}
 }
 
+func TestCollectorsShareProcessWideProbeLimit(t *testing.T) {
+	root := t.TempDir()
+	for index := 0; index < 8; index++ {
+		worker := filepath.Join(root, fmt.Sprintf("task-%02d", index), "api")
+		worktree := filepath.Join(root, fmt.Sprintf("worktree-%02d", index))
+		mustMkdirAll(t, worker)
+		mustMkdirAll(t, worktree)
+		writeFile(t, filepath.Join(worker, "status"), "in_progress\n")
+		writeFile(t, filepath.Join(worker, "worktree"), worktree+"\n")
+	}
+
+	var active atomic.Int32
+	var maximum atomic.Int32
+	ready := make(chan struct{})
+	release := make(chan struct{})
+	var once sync.Once
+	runner := func(ctx context.Context, _ string, _ string, _ ...string) ([]byte, error) {
+		now := active.Add(1)
+		defer active.Add(-1)
+		for {
+			old := maximum.Load()
+			if now <= old || maximum.CompareAndSwap(old, now) {
+				break
+			}
+		}
+		if now == 16 {
+			once.Do(func() { close(ready) })
+		}
+		select {
+		case <-release:
+			return []byte(`{}`), nil
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+
+	var collections sync.WaitGroup
+	collections.Add(2)
+	for range 2 {
+		go func() {
+			defer collections.Done()
+			dashboard.Collector{FleetRoot: root, Run: runner, ProbeTimeout: time.Second}.Collect(t.Context())
+		}()
+	}
+	select {
+	case <-ready:
+	case <-time.After(time.Second):
+		close(release)
+		t.Fatal("collectors did not reach the process-wide probe limit")
+	}
+	time.Sleep(25 * time.Millisecond)
+	close(release)
+	collections.Wait()
+	if got := maximum.Load(); got > 16 {
+		t.Fatalf("maximum active probes across collectors = %d, want at most 16", got)
+	}
+}
+
 func TestCollectorUsesAnIndependentTimeoutForEachProbe(t *testing.T) {
 	root := t.TempDir()
 	worker := filepath.Join(root, "task-a", "api")
@@ -128,7 +186,11 @@ func TestCollectorAllocatesProbeTimeoutOnlyAcrossEnrichableWorkers(t *testing.T)
 	for index := 0; index < invalidWorkerCount; index++ {
 		worker := filepath.Join(root, fmt.Sprintf("invalid-%02d", index), "api")
 		mustMkdirAll(t, worker)
-		writeFile(t, filepath.Join(worker, "status"), "in_progress\n")
+		status := "orphaned"
+		if index%2 == 0 {
+			status = "invalid"
+		}
+		writeFile(t, filepath.Join(worker, "status"), status+"\n")
 		writeFile(t, filepath.Join(worker, "worktree"), filepath.Join(root, fmt.Sprintf("missing-%02d", index))+"\n")
 	}
 	healthyWorker := filepath.Join(root, "healthy", "api")

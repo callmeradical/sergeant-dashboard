@@ -82,7 +82,9 @@ func TestStateAPIBoundsProbeConcurrencyAcrossRequests(t *testing.T) {
 
 	var active atomic.Int32
 	var maximum atomic.Int32
+	var total atomic.Int32
 	runner := func(ctx context.Context, _ string, name string, _ ...string) ([]byte, error) {
+		total.Add(1)
 		now := active.Add(1)
 		defer active.Add(-1)
 		for {
@@ -117,6 +119,9 @@ func TestStateAPIBoundsProbeConcurrencyAcrossRequests(t *testing.T) {
 
 	if got := maximum.Load(); got > 16 {
 		t.Fatalf("maximum active probes across requests = %d, want at most 16", got)
+	}
+	if got := total.Load(); got != 16 {
+		t.Fatalf("probes across overlapping requests = %d, want one shared 16-probe collection", got)
 	}
 	for response := range responses {
 		body := response.Body.String()

@@ -55,6 +55,7 @@ type Worker struct {
 	NoMistakes  ToolStatus    `json:"noMistakes"`
 	Graphify    FileMetadata  `json:"graphify"`
 	OCInject    AuditMetadata `json:"ocInject"`
+	enrichable  bool
 }
 
 type FileMetadata struct {
@@ -142,7 +143,7 @@ func (c Collector) enrichWorkers(ctx context.Context, workers []Worker) {
 	}
 	enrichableWorkers := 0
 	for index := range workers {
-		if workers[index].Worktree != "" {
+		if workers[index].enrichable {
 			enrichableWorkers++
 		}
 	}
@@ -180,7 +181,7 @@ func (c Collector) enrichWorkers(ctx context.Context, workers []Worker) {
 
 func (c Collector) enrichWorker(parent context.Context, worker *Worker) {
 	worker.PullRequest.Checks = []Check{}
-	if worker.Worktree == "" {
+	if !worker.enrichable {
 		return
 	}
 	worker.Graphify = graphifyMetadata(worker.Worktree)
@@ -282,6 +283,11 @@ func collectWorker(dir, task, project string, now time.Time, staleAfter time.Dur
 	worker.TDTask, _, _ = readScalarWithTime(filepath.Join(dir, "td_task"))
 	worker.Worktree, _, _ = readScalarWithTime(filepath.Join(dir, "worktree"))
 	worker.Message = fileMetadata(filepath.Join(dir, "message"))
+	if worker.Worktree != "" {
+		if info, statErr := os.Stat(worker.Worktree); statErr == nil && info.IsDir() {
+			worker.enrichable = true
+		}
+	}
 
 	if worker.Status == "unknown" {
 		return worker, warnings
@@ -289,11 +295,8 @@ func collectWorker(dir, task, project string, now time.Time, staleAfter time.Dur
 	if worker.Status == "orphaned" {
 		return worker, warnings
 	}
-	if worker.Worktree != "" {
-		if info, statErr := os.Stat(worker.Worktree); statErr != nil || !info.IsDir() {
-			worker.Worktree = ""
-			return worker, warnings
-		}
+	if worker.Worktree != "" && !worker.enrichable {
+		return worker, warnings
 	}
 	if isTerminal(worker.Status) {
 		worker.Health = "complete"

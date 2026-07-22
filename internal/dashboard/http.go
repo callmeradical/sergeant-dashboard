@@ -14,6 +14,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -21,17 +22,31 @@ type Source interface {
 	Collect(context.Context) State
 }
 
+type collectionCall struct {
+	done  chan struct{}
+	state State
+}
+
+type coalescingSource struct {
+	source Source
+	mu     sync.Mutex
+	active *collectionCall
+}
+
 //go:embed web/*
 var webAssets embed.FS
 
 func NewHandler(source Source) http.Handler {
+	sharedSource := &coalescingSource{source: source}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", getOnly(func(writer http.ResponseWriter, _ *http.Request) {
 		writeJSON(writer, map[string]string{"status": "ok"})
 	}))
 	mux.HandleFunc("/sergeant/api/state", getOnly(func(writer http.ResponseWriter, request *http.Request) {
 		writer.Header().Set("Cache-Control", "no-store")
-		writeJSON(writer, projectState(source.Collect(request.Context())))
+		ctx, cancel := context.WithTimeout(request.Context(), maxEnrichmentTime)
+		defer cancel()
+		writeJSON(writer, projectState(sharedSource.Collect(ctx)))
 	}))
 	mux.HandleFunc("/", getOnly(func(writer http.ResponseWriter, request *http.Request) {
 		if request.URL.Path == "/" || request.URL.Path == "/sergeant" {
@@ -46,6 +61,30 @@ func NewHandler(source Source) http.Handler {
 	}
 	mux.Handle("/sergeant/", getOnly(http.StripPrefix("/sergeant/", http.FileServer(http.FS(assets))).ServeHTTP))
 	return securityHeaders(mux)
+}
+
+func (source *coalescingSource) Collect(ctx context.Context) State {
+	source.mu.Lock()
+	if source.active != nil {
+		active := source.active
+		source.mu.Unlock()
+		select {
+		case <-active.done:
+			return active.state
+		case <-ctx.Done():
+			return State{Workers: []Worker{}, Warnings: []string{}}
+		}
+	}
+	active := &collectionCall{done: make(chan struct{})}
+	source.active = active
+	source.mu.Unlock()
+
+	active.state = source.source.Collect(ctx)
+	source.mu.Lock()
+	source.active = nil
+	close(active.done)
+	source.mu.Unlock()
+	return active.state
 }
 
 func getOnly(next http.HandlerFunc) http.HandlerFunc {
