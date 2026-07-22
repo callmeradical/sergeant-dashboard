@@ -165,28 +165,40 @@ func (c Collector) enrichWorker(parent context.Context, worker *Worker) {
 	if timeout <= 0 {
 		timeout = 3 * time.Second
 	}
-	githubCtx, cancelGitHub := context.WithTimeout(parent, timeout)
-	output, err := run(githubCtx, worker.Worktree, "gh", "pr", "view", "--json", "url,state,statusCheckRollup")
-	cancelGitHub()
-	if err == nil && len(output) <= 1<<20 {
-		var response struct {
-			URL               string  `json:"url"`
-			State             string  `json:"state"`
-			StatusCheckRollup []Check `json:"statusCheckRollup"`
-		}
-		if json.Unmarshal(output, &response) == nil {
-			if response.StatusCheckRollup == nil {
-				response.StatusCheckRollup = []Check{}
+	pullRequest := make(chan PullRequest, 1)
+	go func() {
+		result := PullRequest{Checks: []Check{}}
+		githubCtx, cancelGitHub := context.WithTimeout(parent, timeout)
+		defer cancelGitHub()
+		output, err := run(githubCtx, worker.Worktree, "gh", "pr", "view", "--json", "url,state,statusCheckRollup")
+		if err == nil && len(output) <= 1<<20 {
+			var response struct {
+				URL               string  `json:"url"`
+				State             string  `json:"state"`
+				StatusCheckRollup []Check `json:"statusCheckRollup"`
 			}
-			worker.PullRequest = PullRequest{URL: response.URL, State: response.State, Checks: response.StatusCheckRollup}
+			if json.Unmarshal(output, &response) == nil {
+				if response.StatusCheckRollup == nil {
+					response.StatusCheckRollup = []Check{}
+				}
+				result = PullRequest{URL: response.URL, State: response.State, Checks: response.StatusCheckRollup}
+			}
 		}
-	}
-	noMistakesCtx, cancelNoMistakes := context.WithTimeout(parent, timeout)
-	noMistakesOutput, err := run(noMistakesCtx, worker.Worktree, "no-mistakes", "runs", "--limit", "1")
-	cancelNoMistakes()
-	if err == nil {
-		worker.NoMistakes = ToolStatus{Available: true, Phase: noMistakesPhase(noMistakesOutput)}
-	}
+		pullRequest <- result
+	}()
+	noMistakes := make(chan ToolStatus, 1)
+	go func() {
+		result := ToolStatus{}
+		noMistakesCtx, cancelNoMistakes := context.WithTimeout(parent, timeout)
+		defer cancelNoMistakes()
+		output, err := run(noMistakesCtx, worker.Worktree, "no-mistakes", "runs", "--limit", "1")
+		if err == nil {
+			result = ToolStatus{Available: true, Phase: noMistakesPhase(output)}
+		}
+		noMistakes <- result
+	}()
+	worker.PullRequest = <-pullRequest
+	worker.NoMistakes = <-noMistakes
 }
 
 func noMistakesPhase(output []byte) string {

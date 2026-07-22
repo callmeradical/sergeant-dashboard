@@ -2,6 +2,7 @@ package dashboard_test
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -76,6 +77,41 @@ func TestCollectorUsesAnIndependentTimeoutForEachProbe(t *testing.T) {
 	state := dashboard.Collector{FleetRoot: root, Run: runner, ProbeTimeout: time.Millisecond}.Collect(t.Context())
 	if !state.Workers[0].NoMistakes.Available {
 		t.Fatal("a timed-out GitHub probe exhausted the no-mistakes probe timeout")
+	}
+}
+
+func TestCollectorBoundsDegradedFleetLatency(t *testing.T) {
+	root := t.TempDir()
+	for index := 0; index < 17; index++ {
+		worker := filepath.Join(root, fmt.Sprintf("task-%02d", index), "api")
+		worktree := filepath.Join(root, fmt.Sprintf("worktree-%02d", index))
+		mustMkdirAll(t, worker)
+		mustMkdirAll(t, worktree)
+		writeFile(t, filepath.Join(worker, "status"), "in_progress\n")
+		writeFile(t, filepath.Join(worker, "worktree"), worktree+"\n")
+	}
+
+	var active atomic.Int32
+	runner := func(ctx context.Context, _ string, _ string, _ ...string) ([]byte, error) {
+		active.Add(1)
+		defer active.Add(-1)
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+
+	probeTimeout := 100 * time.Millisecond
+	started := time.Now()
+	state := dashboard.Collector{FleetRoot: root, Run: runner, ProbeTimeout: probeTimeout}.Collect(t.Context())
+	elapsed := time.Since(started)
+
+	if len(state.Workers) != 17 {
+		t.Fatalf("workers = %d, want complete 17-worker projection", len(state.Workers))
+	}
+	if elapsed >= 4*probeTimeout {
+		t.Fatalf("degraded collection took %v, want less than %v", elapsed, 4*probeTimeout)
+	}
+	if got := active.Load(); got != 0 {
+		t.Fatalf("active probes after collection = %d, want 0", got)
 	}
 }
 
