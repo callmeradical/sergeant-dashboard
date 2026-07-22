@@ -66,6 +66,7 @@ type Check struct {
 	Name       string `json:"name,omitempty"`
 	Status     string `json:"status,omitempty"`
 	Conclusion string `json:"conclusion,omitempty"`
+	State      string `json:"state,omitempty"`
 }
 
 type ToolStatus struct {
@@ -292,7 +293,7 @@ func latestTime(left, right time.Time) time.Time {
 
 var (
 	sensitiveKey = regexp.MustCompile(`(?i)(authorization|body|cookie|credential|env|message|password|prompt|secret|token)`)
-	secretValue  = regexp.MustCompile(`(?i)(bearer\s+)[^\s]+|(password\s*=\s*)[^\s]+|gh[pousr]_[A-Za-z0-9_]{20,}`)
+	secretValue  = regexp.MustCompile(`(?i)(bearer\s+)[^\s,;]+|((?:credential|password|secret|token)\s*[:=]\s*)[^\s,;]+|gh[pousr]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,}|sk-[A-Za-z0-9_-]{20,}`)
 )
 
 func RedactMetadata(value any) any {
@@ -326,8 +327,12 @@ func redactString(value string) string {
 		if strings.HasPrefix(lower, "bearer ") {
 			return "Bearer [REDACTED]"
 		}
-		if index := strings.Index(match, "="); index >= 0 {
-			return match[:index+1] + "[REDACTED]"
+		if index := strings.IndexAny(match, "=:"); index >= 0 {
+			end := index + 1
+			for end < len(match) && (match[end] == ' ' || match[end] == '\t') {
+				end++
+			}
+			return match[:end] + "[REDACTED]"
 		}
 		return "[REDACTED]"
 	})

@@ -8,60 +8,135 @@ import (
 	"testing"
 )
 
-func TestServiceAndLifecycleScriptsAreSafeAndComplete(t *testing.T) {
-	unit := readProjectFile(t, "deploy/sergeant-dashboard.service")
-	for _, required := range []string{"ExecStart=%h/.local/bin/sergeant-dashboard", "127.0.0.1:8992", "Restart=on-failure", "NoNewPrivileges=true"} {
-		if !strings.Contains(unit, required) {
-			t.Errorf("service unit lacks %q", required)
-		}
-	}
-	for _, script := range []string{"scripts/install.sh", "scripts/uninstall.sh", "scripts/validate.sh"} {
-		command := exec.Command("sh", "-n", script)
-		if output, err := command.CombinedOutput(); err != nil {
-			t.Fatalf("%s syntax: %v: %s", script, err, output)
-		}
-	}
-	install := readProjectFile(t, "scripts/install.sh")
-	uninstall := readProjectFile(t, "scripts/uninstall.sh")
-	if !strings.Contains(install, "systemctl --user enable --now") || !strings.Contains(uninstall, "systemctl --user disable --now") {
-		t.Fatal("lifecycle scripts do not enable/disable the user service")
-	}
-}
+func TestInstallAndUninstallManageUserService(t *testing.T) {
+	home := t.TempDir()
+	mocks := filepath.Join(t.TempDir(), "bin")
+	mustMkdir(t, mocks)
+	logPath := filepath.Join(t.TempDir(), "systemctl.log")
+	writeExecutable(t, filepath.Join(mocks, "systemctl"), `#!/bin/sh
+printf '%s\n' "$*" >> "$SYSTEMCTL_LOG"
+`)
+	writeExecutable(t, filepath.Join(mocks, "go"), `#!/bin/sh
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = "-o" ]; then
+    shift
+    mkdir -p "$(dirname "$1")"
+    printf '#!/bin/sh\n' > "$1"
+    chmod +x "$1"
+    exit 0
+  fi
+  shift
+done
+exit 1
+`)
+	env := append(os.Environ(),
+		"HOME="+home,
+		"XDG_CONFIG_HOME="+filepath.Join(home, "config"),
+		"PATH="+mocks+":/usr/bin:/bin",
+		"SYSTEMCTL_LOG="+logPath,
+	)
 
-func TestDocumentationPinsTailscaleSubpathAndHealthValidation(t *testing.T) {
-	readme := readProjectFile(t, "README.md")
-	for _, required := range []string{
-		"127.0.0.1:8992",
-		"tailscale serve --bg --set-path /sergeant http://127.0.0.1:8992/sergeant",
-		"https://cleanthes.taila4fb6a.ts.net/sergeant/",
-		"/healthz",
-	} {
-		if !strings.Contains(readme, required) {
-			t.Errorf("README lacks %q", required)
+	runScript(t, env, "scripts/install.sh")
+	binary := filepath.Join(home, ".local", "bin", "sergeant-dashboard")
+	unit := filepath.Join(home, "config", "systemd", "user", "sergeant-dashboard.service")
+	for _, path := range []string{binary, unit} {
+		if _, err := os.Stat(path); err != nil {
+			t.Fatalf("installed artifact %s: %v", path, err)
 		}
 	}
-	for _, path := range []string{"deploy/sergeant-dashboard.service", "scripts/install.sh", "scripts/validate.sh"} {
-		contents := readProjectFile(t, path)
-		if !strings.Contains(contents, "127.0.0.1:8992") {
-			t.Errorf("%s lacks the fixed listener", path)
-		}
-		if strings.Contains(contents, "127.0.0.1:8991") {
-			t.Errorf("%s retains the conflicting listener", path)
-		}
-	}
-	validate := readProjectFile(t, "scripts/validate.sh")
-	for _, required := range []string{"tailscale serve status --json", "127.0.0.1:8992/sergeant", "'/sergeant'"} {
-		if !strings.Contains(validate, required) {
-			t.Errorf("validation script lacks Serve assertion %q", required)
-		}
-	}
-}
-
-func readProjectFile(t *testing.T, path string) string {
-	t.Helper()
-	data, err := os.ReadFile(filepath.Clean(path))
+	unitData, err := os.ReadFile(unit)
 	if err != nil {
 		t.Fatal(err)
 	}
-	return string(data)
+	for _, required := range []string{"ExecStart=%h/.local/bin/sergeant-dashboard", "127.0.0.1:8992", "Restart=on-failure", "NoNewPrivileges=true", "ProtectSystem=strict", "ProtectHome=read-only"} {
+		if !strings.Contains(string(unitData), required) {
+			t.Errorf("installed unit lacks %q: %s", required, unitData)
+		}
+	}
+
+	runScript(t, env, "scripts/uninstall.sh")
+	for _, path := range []string{binary, unit} {
+		if _, err := os.Stat(path); !os.IsNotExist(err) {
+			t.Fatalf("uninstalled artifact still exists %s: %v", path, err)
+		}
+	}
+	logData, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantLog := "--user daemon-reload\n--user enable --now sergeant-dashboard.service\n--user disable --now sergeant-dashboard.service\n--user daemon-reload\n"
+	if string(logData) != wantLog {
+		t.Fatalf("systemctl calls = %q, want %q", logData, wantLog)
+	}
+}
+
+func TestDocumentationCoversServeValidationAndRollback(t *testing.T) {
+	readme, err := os.ReadFile("README.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, required := range []string{
+		"tailscale serve --bg --set-path /sergeant http://127.0.0.1:8992/sergeant",
+		"https://cleanthes.taila4fb6a.ts.net/sergeant/",
+		"./scripts/validate.sh",
+		"## Rollback",
+		"tailscale serve --https=443 --set-path=/sergeant off",
+		"./scripts/uninstall.sh",
+	} {
+		if !strings.Contains(string(readme), required) {
+			t.Errorf("README lacks %q", required)
+		}
+	}
+}
+
+func TestValidationRequiresServePathAndBackendAssociation(t *testing.T) {
+	home := t.TempDir()
+	binDir := filepath.Join(home, ".local", "bin")
+	mocks := filepath.Join(t.TempDir(), "bin")
+	mustMkdir(t, binDir)
+	mustMkdir(t, mocks)
+	writeExecutable(t, filepath.Join(mocks, "curl"), "#!/bin/sh\nexit 0\n")
+	writeExecutable(t, filepath.Join(mocks, "tailscale"), "#!/bin/sh\nprintf '%s\\n' \"$TAILSCALE_STATUS\"\n")
+
+	build := exec.Command("go", "build", "-o", filepath.Join(binDir, "sergeant-dashboard"), "./cmd/sergeant-dashboard")
+	if output, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("build validator: %v: %s", err, output)
+	}
+	baseEnv := append(os.Environ(), "HOME="+home, "PATH="+mocks+":/usr/bin:/bin")
+	misassociated := `{"Web":{"cleanthes.taila4fb6a.ts.net:443":{"Handlers":{"/sergeant":{"Proxy":"http://127.0.0.1:9999/sergeant"},"/other":{"Proxy":"http://127.0.0.1:8992/sergeant"}}},"other-host:443":{"Handlers":{"/sergeant":{"Proxy":"http://127.0.0.1:8992/sergeant"}}}}}`
+	command := exec.Command("sh", "scripts/validate.sh")
+	command.Env = append(baseEnv, "TAILSCALE_STATUS="+misassociated)
+	if output, err := command.CombinedOutput(); err == nil {
+		t.Fatalf("validation accepted unrelated Serve path/backend values: %s", output)
+	}
+
+	associated := `{"Web":{"cleanthes.taila4fb6a.ts.net:443":{"Handlers":{"/sergeant":{"Proxy":"http://127.0.0.1:8992/sergeant"}}}}}`
+	command = exec.Command("sh", "scripts/validate.sh")
+	command.Env = append(baseEnv, "TAILSCALE_STATUS="+associated)
+	if output, err := command.CombinedOutput(); err != nil {
+		t.Fatalf("validation rejected associated Serve path/backend: %v: %s", err, output)
+	}
+}
+
+func runScript(t *testing.T, env []string, path string) {
+	t.Helper()
+	command := exec.Command("sh", path)
+	command.Env = env
+	if output, err := command.CombinedOutput(); err != nil {
+		t.Fatalf("%s: %v: %s", path, err, output)
+	}
+}
+
+func mustMkdir(t *testing.T, path string) {
+	t.Helper()
+	if err := os.MkdirAll(path, 0o755); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func writeExecutable(t *testing.T, path, contents string) {
+	t.Helper()
+	if err := os.WriteFile(path, []byte(contents), 0o755); err != nil {
+		t.Fatal(err)
+	}
 }

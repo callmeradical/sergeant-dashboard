@@ -2,7 +2,7 @@
 
 Read-only operational dashboard for Sergeant fleets, delivery gates, and project activity. The Go binary embeds its responsive frontend and projects source state without changing Sergeant, td, GitHub, no-mistakes, Graphify, oc-inject, repositories, or worker processes.
 
-The collector deliberately reads only whitelisted scalar metadata. Worker-message presence and timestamps are visible, but message contents, prompt bodies, injected message bodies, logs, command output, tokens, environment values, secrets, and credentials are neither rendered nor persisted.
+The collector deliberately reads only whitelisted scalar metadata. The HTTP boundary emits opaque task/project aliases, validated td IDs and PR links, enumerated lifecycle/tool states, and body-free file metadata. Worker-message presence and timestamps are visible, but source names, branches, worktree paths, message contents, prompt bodies, injected message bodies, logs, command output, tokens, environment values, secrets, and credentials are neither rendered nor persisted.
 
 ## Build and run
 
@@ -45,7 +45,18 @@ Validate local health, the local UI, Serve configuration, and tailnet HTTPS afte
 ./scripts/validate.sh
 ```
 
-Set `SERGEANT_TAILNET_URL` to validate a different tailnet hostname.
+Set both `SERGEANT_TAILNET_URL` and `SERGEANT_TAILNET_HOST` (including the HTTPS port, for example `host.example.ts.net:443`) to validate a different tailnet hostname.
+
+## Rollback
+
+Remove only the dashboard Serve route, then stop and remove the user service:
+
+```sh
+tailscale serve --https=443 --set-path=/sergeant off
+./scripts/uninstall.sh
+```
+
+Verify rollback with `tailscale serve status` and `systemctl --user status sergeant-dashboard.service`. Do not use `tailscale serve reset`, because it also removes unrelated routes on the node.
 
 ## Development
 

@@ -97,7 +97,7 @@ func TestCollectorEnrichesWorkerWithReadOnlyDeliveryMetadata(t *testing.T) {
 		}
 		switch name {
 		case "gh":
-			return []byte(`{"url":"https://github.com/acme/api/pull/7","state":"OPEN","statusCheckRollup":[{"name":"test","status":"COMPLETED","conclusion":"SUCCESS"}]}`), nil
+			return []byte(`{"url":"https://github.com/acme/api/pull/7","state":"OPEN","statusCheckRollup":[{"name":"test","status":"COMPLETED","conclusion":"SUCCESS"},{"context":"legacy-ci","state":"PENDING"}]}`), nil
 		case "no-mistakes":
 			return []byte("run 42 review running token=unrecognized-secret\n"), nil
 		default:
@@ -108,7 +108,7 @@ func TestCollectorEnrichesWorkerWithReadOnlyDeliveryMetadata(t *testing.T) {
 
 	state := dashboard.Collector{FleetRoot: root, Run: runner}.Collect(t.Context())
 	got := state.Workers[0]
-	if got.PullRequest.URL != "https://github.com/acme/api/pull/7" || got.PullRequest.Checks[0].Conclusion != "SUCCESS" {
+	if got.PullRequest.URL != "https://github.com/acme/api/pull/7" || got.PullRequest.Checks[0].Conclusion != "SUCCESS" || got.PullRequest.Checks[1].State != "PENDING" {
 		t.Fatalf("pull request = %#v", got.PullRequest)
 	}
 	if !got.NoMistakes.Available || got.NoMistakes.Phase != "review" {

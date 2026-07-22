@@ -9,6 +9,17 @@ const text = (tag, value, className) => {
   return node;
 };
 
+const tdTaskLink = value => {
+  if (!/^td-[A-Za-z0-9]+$/.test(value || '')) return text('dd', value);
+  const node = document.createElement('dd');
+  const link = document.createElement('a');
+  link.href = `http://127.0.0.1:8991/api/issues/${encodeURIComponent(value)}`;
+  link.rel = 'noreferrer';
+  link.textContent = value;
+  node.append(link);
+  return node;
+};
+
 function render() {
   const attention = state.workers.filter(worker => ['stale', 'orphaned'].includes(worker.health));
   document.querySelector('#total').textContent = state.workers.length;
@@ -37,9 +48,10 @@ function workerCard(worker) {
   card.append(head);
   const meta = document.createElement('dl');
   meta.className = 'meta';
-  [['Status', worker.status], ['Branch', worker.branch], ['Agent', worker.agent], ['td', worker.tdTask]].forEach(([label, value]) => {
+  [['Status', worker.status], ['Agent', worker.agent]].forEach(([label, value]) => {
     meta.append(text('dt', label), text('dd', value));
   });
+  meta.append(text('dt', 'td'), tdTaskLink(worker.tdTask));
   if (worker.pullRequest?.url) {
     meta.append(text('dt', 'Pull request'));
     const value = document.createElement('dd');
@@ -50,7 +62,7 @@ function workerCard(worker) {
     value.append(link); meta.append(value);
   }
   if (worker.pullRequest?.checks?.length) {
-    const checks = worker.pullRequest.checks.map(check => `${check.name || 'check'}: ${check.conclusion || check.status || 'pending'}`);
+    const checks = worker.pullRequest.checks.map(check => `${check.name || 'check'}: ${check.conclusion || check.state || check.status || 'pending'}`);
     meta.append(text('dt', 'Checks'), text('dd', checks.join(', ')));
   }
   if (worker.message?.present) {
@@ -61,7 +73,7 @@ function workerCard(worker) {
   }
   if (worker.graphify?.present) {
     const updated = worker.graphify?.updatedAt ? `, ${new Date(worker.graphify.updatedAt).toLocaleString()}` : '';
-    meta.append(text('dt', 'Graphify'), text('dd', `${worker.graphify?.summary || 'available'}${updated}`));
+    meta.append(text('dt', 'Graphify'), text('dd', `${worker.graphify?.status || 'available'}${updated}`));
   }
   card.append(meta);
   const signals = document.createElement('div');
