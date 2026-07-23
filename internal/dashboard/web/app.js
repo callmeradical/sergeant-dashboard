@@ -116,7 +116,6 @@ function workerCard(worker) {
     card.append(signals);
   }
 
-  // Click anywhere on the tile to open the drawer
   const openThis = () => openDrawer(worker, card);
   card.addEventListener('click', openThis);
   card.addEventListener('keydown', e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); openThis(); } });
@@ -125,6 +124,7 @@ function workerCard(worker) {
 }
 
 function buildDetail(container, worker) {
+  // ── Meta grid ──────────────────────────────────────────────────────────────
   const meta = document.createElement('dl');
   meta.className = 'meta';
   const row = (label, value) => {
@@ -134,7 +134,6 @@ function buildDetail(container, worker) {
   row('Repo', worker.repository);
   row('Agent', worker.agent);
   row('Worktree', worker.worktree);
-  row('td', worker.tdTask);
   if (worker.pullRequest?.url) {
     const dd = document.createElement('dd');
     const a = document.createElement('a');
@@ -150,7 +149,7 @@ function buildDetail(container, worker) {
   if (worker.pullRequest?.comments?.length) {
     worker.pullRequest.comments.forEach(c => row('Comment', `${c.author || ''}: ${c.body || ''}`.trim()));
   }
-  [['Message', worker.message], ['Diag', worker.diagnostic], ['Log', worker.log], ['Handoff', worker.handoff], ['td file', worker.td]].forEach(([label, file]) => {
+  [['Message', worker.message], ['Diag', worker.diagnostic], ['Log', worker.log], ['Handoff', worker.handoff]].forEach(([label, file]) => {
     if (file?.present) row(label, file.summary || 'present');
   });
   if (worker.noMistakes?.available || worker.noMistakes?.status) {
@@ -167,11 +166,52 @@ function buildDetail(container, worker) {
     row('oc-inject', `acked${at}`);
   }
   container.append(meta);
+
+  // ── Message block ──────────────────────────────────────────────────────────
   if (worker.message?.present && worker.message?.summary) {
     const msg = document.createElement('div');
     msg.className = 'message';
     msg.textContent = worker.message.summary;
     container.append(msg);
+  }
+
+  // ── Tech Debt section ──────────────────────────────────────────────────────
+  const hasTD = worker.tdTask || worker.td?.present;
+  if (hasTD) {
+    const section = document.createElement('div');
+    section.className = 'td-section';
+
+    const hdr = document.createElement('div');
+    hdr.className = 'td-section-header';
+    hdr.textContent = 'Tech Debt';
+    section.append(hdr);
+
+    const card = document.createElement('div');
+    card.className = 'td-card';
+
+    if (worker.tdTask) {
+      const chip = document.createElement('code');
+      chip.className = 'td-chip';
+      chip.textContent = worker.tdTask;
+      card.append(chip);
+    }
+
+    if (worker.td?.present && worker.td?.summary) {
+      const desc = document.createElement('p');
+      desc.className = 'td-desc';
+      desc.textContent = worker.td.summary;
+      card.append(desc);
+    }
+
+    if (worker.td?.status && worker.td.status !== 'available') {
+      const pill = document.createElement('span');
+      pill.className = 'td-pill';
+      pill.textContent = worker.td.status;
+      card.append(pill);
+    }
+
+    section.append(card);
+    container.append(section);
   }
 }
 
@@ -184,9 +224,18 @@ document.querySelectorAll('[data-filter]').forEach(btn => btn.addEventListener('
   render();
 }));
 
-// ── Boot ─────────────────────────────────────────────────────────────────────
+// ── Data fetch + 5s poll ─────────────────────────────────────────────────────
 
-fetch('api/state', { cache:'no-store' })
-  .then(r => { if (!r.ok) throw new Error('unavailable'); return r.json(); })
-  .then(data => { state = data; render(); })
-  .catch(() => { workersNode.replaceChildren(text('p', 'Fleet state is temporarily unavailable.', 'empty')); });
+function fetchState() {
+  fetch('api/state', { cache:'no-store' })
+    .then(r => { if (!r.ok) throw new Error('unavailable'); return r.json(); })
+    .then(data => { state = data; render(); })
+    .catch(() => {
+      if (!state.workers.length) {
+        workersNode.replaceChildren(text('p', 'Fleet state is temporarily unavailable.', 'empty'));
+      }
+    });
+}
+
+fetchState();
+setInterval(fetchState, 5000);
