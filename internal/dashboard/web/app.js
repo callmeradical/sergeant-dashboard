@@ -9,14 +9,10 @@ const text = (tag, value, className) => {
   return node;
 };
 
-const tdTaskLink = value => {
-  return text('dd', /^td-[A-Za-z0-9]+$/.test(value || '') ? value : '');
-};
-
 function render() {
-  const attention = state.workers.filter(worker => ['stale', 'orphaned'].includes(worker.health));
+  const attention = state.workers.filter(w => ['stale', 'orphaned'].includes(w.health));
   document.querySelector('#total').textContent = state.workers.length;
-  document.querySelector('#active').textContent = state.workers.filter(worker => worker.health === 'active').length;
+  document.querySelector('#active').textContent = state.workers.filter(w => w.health === 'active').length;
   document.querySelector('#attention').textContent = attention.length;
   document.querySelector('#updated').textContent = `Updated ${new Date(state.collectedAt).toLocaleString()}`;
   const warnings = document.querySelector('#warnings');
@@ -24,94 +20,162 @@ function render() {
   warnings.textContent = state.warnings.join('\n');
 
   workersNode.replaceChildren();
-  const shown = state.workers.filter(worker => filter === 'all' || (filter === 'attention' ? ['stale', 'orphaned'].includes(worker.health) : worker.health === filter));
+  const shown = state.workers.filter(w =>
+    filter === 'all' ||
+    (filter === 'attention' ? ['stale', 'orphaned'].includes(w.health) : w.health === filter)
+  );
   if (!shown.length) workersNode.append(text('p', 'No workers match this view.', 'empty'));
-  shown.forEach(worker => workersNode.append(workerCard(worker)));
+  shown.forEach(w => workersNode.append(workerCard(w)));
 }
 
 function workerCard(worker) {
+  const colors = { active: 'var(--acid)', stale: 'var(--amber)', orphaned: 'var(--red)', complete: 'var(--muted)' };
   const card = document.createElement('article');
   card.className = 'worker';
-  const colors = { active: 'var(--acid)', stale: 'var(--amber)', orphaned: 'var(--red)', complete: 'var(--muted)' };
   card.style.setProperty('--status', colors[worker.health] || 'var(--muted)');
-  const head = document.createElement('header');
-  const title = document.createElement('div');
-  title.append(text('h3', worker.project), text('div', worker.task, 'task'));
-  head.append(title, text('span', worker.health, 'badge'));
+
+  // — Primary: name + badge —
+  const head = document.createElement('div');
+  head.className = 'worker-head';
+  head.append(text('h3', worker.project), text('span', worker.health, 'badge'));
   card.append(head);
-  const meta = document.createElement('dl');
-  meta.className = 'meta';
-  [['Repository', worker.repository], ['Status', worker.status], ['Agent', worker.agent], ['Branch', worker.branch], ['Worktree', worker.worktree]].forEach(([label, value]) => {
-    meta.append(text('dt', label), text('dd', value));
-  });
-  meta.append(text('dt', 'td'), tdTaskLink(worker.tdTask));
-  if (worker.pullRequest?.url) {
-    meta.append(text('dt', 'Pull request'));
-    const value = document.createElement('dd');
-    const link = document.createElement('a');
-    link.href = worker.pullRequest.url;
-    link.rel = 'noreferrer';
-    link.textContent = worker.pullRequest.state || 'View PR';
-    value.append(link); meta.append(value);
-  } else if (worker.pullRequest?.status) {
-    meta.append(text('dt', 'Pull request'), text('dd', worker.pullRequest.status));
+
+  // — Task (truncated, 1 line) —
+  if (worker.task) {
+    const sub = document.createElement('div');
+    sub.className = 'worker-sub';
+    sub.title = worker.task;
+    sub.textContent = worker.task;
+    card.append(sub);
   }
-  if (worker.pullRequest?.url && worker.pullRequest?.status) {
-    meta.append(text('dt', 'PR source'), text('dd', worker.pullRequest.status));
+
+  // — Status · branch —
+  const line = document.createElement('div');
+  line.className = 'worker-line';
+  const branch = worker.branch ? worker.branch.replace(/^refs\/heads\//, '') : null;
+  const parts = [worker.status, branch ? `${branch.length > 28 ? branch.slice(0, 28) + '…' : branch}` : null].filter(Boolean);
+  if (parts.length) {
+    line.innerHTML = parts.map(p => `<strong>${p}</strong>`).join(' <span style="color:var(--muted)">·</span> ');
   }
-  if (worker.pullRequest?.checks?.length) {
-    const checks = worker.pullRequest.checks.map(check => `${check.name || 'check'}: ${check.conclusion || check.state || check.status || 'pending'}`);
-    meta.append(text('dt', 'Checks'), text('dd', checks.join(', ')));
+  card.append(line);
+
+  // — Active signals only —
+  const activeSignals = [
+    ['message', worker.message?.present],
+    ['graphify', worker.graphify?.present],
+    ['no-mistakes', worker.noMistakes?.available],
+    ['oc-inject', worker.ocInject?.responsePending || worker.ocInject?.responseAcked],
+  ].filter(([, on]) => on).map(([label]) => label);
+
+  if (activeSignals.length) {
+    const signals = document.createElement('div');
+    signals.className = 'signals';
+    activeSignals.forEach(label => signals.append(text('span', label, 'signal')));
+    card.append(signals);
   }
-  if (worker.pullRequest?.comments?.length) {
-    const comments = document.createElement('dd');
-    worker.pullRequest.comments.forEach((comment, index) => {
-      if (index) comments.append(document.createElement('br'));
-      comments.append(document.createTextNode(`${comment.author || 'comment'}: ${comment.body || '-'} `));
-      if (comment.url) {
-        const link = document.createElement('a');
-        link.href = comment.url; link.rel = 'noreferrer'; link.textContent = 'View comment'; comments.append(link);
-      }
+
+  // — Detail toggle —
+  const hasDetail = !!(
+    worker.repository || worker.agent || worker.worktree || worker.tdTask ||
+    worker.pullRequest || worker.message?.present || worker.diagnostic?.present ||
+    worker.log?.present || worker.handoff?.present || worker.td?.present ||
+    worker.noMistakes?.available || worker.graphify?.present ||
+    worker.ocInject?.responsePending || worker.ocInject?.responseAcked
+  );
+
+  if (hasDetail) {
+    const btn = document.createElement('button');
+    btn.className = 'expand-btn';
+    btn.textContent = '▾ Details';
+    const detail = document.createElement('div');
+    detail.className = 'detail';
+
+    btn.addEventListener('click', () => {
+      const open = detail.classList.toggle('open');
+      btn.textContent = open ? '▴ Details' : '▾ Details';
+      if (open && !detail.childElementCount) buildDetail(detail, worker);
     });
-    meta.append(text('dt', 'Comments'), comments);
+
+    card.append(btn, detail);
   }
-  if (worker.message?.present) {
-    meta.append(text('dt', 'Message'), text('dd', worker.message.summary || (worker.message.updatedAt ? `updated ${new Date(worker.message.updatedAt).toLocaleString()}` : 'present')));
-  }
-  [['Diagnostic', worker.diagnostic], ['Log', worker.log], ['Handoff', worker.handoff], ['td details', worker.td]].forEach(([label, file]) => {
-    if (file?.present) meta.append(text('dt', label), text('dd', file.summary || 'present'));
-  });
-  if (worker.noMistakes?.available || worker.noMistakes?.status) {
-    meta.append(text('dt', 'no-mistakes'), text('dd', worker.noMistakes?.summary || worker.noMistakes?.status || (worker.noMistakes?.phase ? `${worker.noMistakes.phase} phase` : 'run detected')));
-  }
-  if (worker.graphify?.present || worker.graphify?.status) {
-    meta.append(text('dt', 'Graphify'), text('dd', worker.graphify?.summary || worker.graphify?.status || 'available'));
-  }
-  if (worker.ocInject?.responsePending) {
-    const pendingAt = worker.ocInject.responsePendingAt ? ` since ${new Date(worker.ocInject.responsePendingAt).toLocaleString()}` : '';
-    meta.append(text('dt', 'oc-inject'), text('dd', `response pending${pendingAt}`));
-  }
-  if (worker.ocInject?.responseAcked) {
-    const ackedAt = worker.ocInject.responseAckedAt ? ` at ${new Date(worker.ocInject.responseAckedAt).toLocaleString()}` : '';
-    meta.append(text('dt', 'oc-inject'), text('dd', `response acknowledged${ackedAt}`));
-  }
-  card.append(meta);
-  const signals = document.createElement('div');
-  signals.className = 'signals';
-  [['message', worker.message?.present], ['graphify', worker.graphify?.present], ['no-mistakes', worker.noMistakes?.available], ['oc-inject', worker.ocInject?.responsePending || worker.ocInject?.responseAcked]].forEach(([label, on]) => {
-    signals.append(text('span', label, `signal ${on ? 'on' : ''}`));
-  });
-  card.append(signals);
+
   return card;
 }
 
-document.querySelectorAll('[data-filter]').forEach(button => button.addEventListener('click', () => {
-  filter = button.dataset.filter;
-  document.querySelectorAll('[data-filter]').forEach(item => item.classList.toggle('selected', item === button));
+function buildDetail(detail, worker) {
+  const meta = document.createElement('dl');
+  meta.className = 'meta';
+
+  const row = (label, value) => {
+    if (!value && value !== 0) return;
+    meta.append(text('dt', label), text('dd', value));
+  };
+
+  row('Repo', worker.repository);
+  row('Agent', worker.agent);
+  row('Worktree', worker.worktree);
+  row('td', worker.tdTask);
+
+  if (worker.pullRequest?.url) {
+    const dd = document.createElement('dd');
+    const a = document.createElement('a');
+    a.href = worker.pullRequest.url;
+    a.rel = 'noreferrer';
+    a.textContent = worker.pullRequest.state || 'View PR';
+    dd.append(a);
+    meta.append(text('dt', 'PR'), dd);
+  } else if (worker.pullRequest?.status) {
+    row('PR', worker.pullRequest.status);
+  }
+
+  if (worker.pullRequest?.checks?.length) {
+    const summary = worker.pullRequest.checks.map(c => `${c.name || 'check'}: ${c.conclusion || c.state || c.status || 'pending'}`).join(', ');
+    row('Checks', summary);
+  }
+
+  if (worker.pullRequest?.comments?.length) {
+    worker.pullRequest.comments.forEach(c => {
+      row('Comment', `${c.author || ''}: ${c.body || ''}`.trim());
+    });
+  }
+
+  [['Message', worker.message], ['Diag', worker.diagnostic], ['Log', worker.log], ['Handoff', worker.handoff], ['td file', worker.td]].forEach(([label, file]) => {
+    if (file?.present) row(label, file.summary || 'present');
+  });
+
+  if (worker.noMistakes?.available || worker.noMistakes?.status) {
+    row('no-mistakes', worker.noMistakes?.summary || worker.noMistakes?.status || (worker.noMistakes?.phase ? `${worker.noMistakes.phase} phase` : 'detected'));
+  }
+
+  if (worker.graphify?.present || worker.graphify?.status) {
+    row('Graphify', worker.graphify?.summary || worker.graphify?.status || 'available');
+  }
+
+  if (worker.ocInject?.responsePending) {
+    const at = worker.ocInject.responsePendingAt ? ` since ${new Date(worker.ocInject.responsePendingAt).toLocaleString()}` : '';
+    row('oc-inject', `pending${at}`);
+  } else if (worker.ocInject?.responseAcked) {
+    const at = worker.ocInject.responseAckedAt ? ` ${new Date(worker.ocInject.responseAckedAt).toLocaleString()}` : '';
+    row('oc-inject', `acked${at}`);
+  }
+
+  detail.append(meta);
+
+  if (worker.message?.present && worker.message?.summary) {
+    const msg = document.createElement('div');
+    msg.className = 'message';
+    msg.textContent = worker.message.summary;
+    detail.append(msg);
+  }
+}
+
+document.querySelectorAll('[data-filter]').forEach(btn => btn.addEventListener('click', () => {
+  filter = btn.dataset.filter;
+  document.querySelectorAll('[data-filter]').forEach(b => b.classList.toggle('selected', b === btn));
   render();
 }));
 
 fetch('api/state', { cache: 'no-store' })
-  .then(response => { if (!response.ok) throw new Error('state unavailable'); return response.json(); })
+  .then(r => { if (!r.ok) throw new Error('state unavailable'); return r.json(); })
   .then(data => { state = data; render(); })
   .catch(() => { workersNode.replaceChildren(text('p', 'Fleet state is temporarily unavailable.', 'empty')); });
