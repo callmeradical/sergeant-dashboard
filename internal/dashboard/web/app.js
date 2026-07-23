@@ -10,7 +10,7 @@ const text = (tag, value, className) => {
 };
 
 function render() {
-  const attention = state.workers.filter(w => ['stale', 'orphaned'].includes(w.health));
+  const attention = state.workers.filter(w => ['stale','orphaned'].includes(w.health));
   document.querySelector('#total').textContent = state.workers.length;
   document.querySelector('#active').textContent = state.workers.filter(w => w.health === 'active').length;
   document.querySelector('#attention').textContent = attention.length;
@@ -18,29 +18,26 @@ function render() {
   const warnings = document.querySelector('#warnings');
   warnings.hidden = !state.warnings.length;
   warnings.textContent = state.warnings.join('\n');
-
   workersNode.replaceChildren();
   const shown = state.workers.filter(w =>
     filter === 'all' ||
-    (filter === 'attention' ? ['stale', 'orphaned'].includes(w.health) : w.health === filter)
+    (filter === 'attention' ? ['stale','orphaned'].includes(w.health) : w.health === filter)
   );
   if (!shown.length) workersNode.append(text('p', 'No workers match this view.', 'empty'));
   shown.forEach(w => workersNode.append(workerCard(w)));
 }
 
 function workerCard(worker) {
-  const colors = { active: 'var(--acid)', stale: 'var(--amber)', orphaned: 'var(--red)', complete: 'var(--muted)' };
+  const colors = { active:'var(--acid)', stale:'var(--amber)', orphaned:'var(--red)', complete:'var(--muted)' };
   const card = document.createElement('article');
   card.className = 'worker';
   card.style.setProperty('--status', colors[worker.health] || 'var(--muted)');
 
-  // — Primary: name + badge —
   const head = document.createElement('div');
   head.className = 'worker-head';
   head.append(text('h3', worker.project), text('span', worker.health, 'badge'));
   card.append(head);
 
-  // — Task (truncated, 1 line) —
   if (worker.task) {
     const sub = document.createElement('div');
     sub.className = 'worker-sub';
@@ -49,17 +46,16 @@ function workerCard(worker) {
     card.append(sub);
   }
 
-  // — Status · branch —
   const line = document.createElement('div');
   line.className = 'worker-line';
   const branch = worker.branch ? worker.branch.replace(/^refs\/heads\//, '') : null;
-  const parts = [worker.status, branch ? `${branch.length > 28 ? branch.slice(0, 28) + '…' : branch}` : null].filter(Boolean);
-  if (parts.length) {
-    line.innerHTML = parts.map(p => `<strong>${p}</strong>`).join(' <span style="color:var(--muted)">·</span> ');
-  }
+  const parts = [
+    worker.status ? `<strong>${worker.status}</strong>` : null,
+    branch ? `<strong>${branch.length > 28 ? branch.slice(0, 28) + '\u2026' : branch}</strong>` : null
+  ].filter(Boolean);
+  line.innerHTML = parts.join(' <span style="color:var(--muted)">\u00b7</span> ');
   card.append(line);
 
-  // — Active signals only —
   const activeSignals = [
     ['message', worker.message?.present],
     ['graphify', worker.graphify?.present],
@@ -74,83 +70,63 @@ function workerCard(worker) {
     card.append(signals);
   }
 
-  // — Detail toggle —
-  const hasDetail = !!(
-    worker.repository || worker.agent || worker.worktree || worker.tdTask ||
+  const hasDetail = !!(worker.repository || worker.agent || worker.worktree || worker.tdTask ||
     worker.pullRequest || worker.message?.present || worker.diagnostic?.present ||
     worker.log?.present || worker.handoff?.present || worker.td?.present ||
     worker.noMistakes?.available || worker.graphify?.present ||
-    worker.ocInject?.responsePending || worker.ocInject?.responseAcked
-  );
+    worker.ocInject?.responsePending || worker.ocInject?.responseAcked);
 
   if (hasDetail) {
     const btn = document.createElement('button');
     btn.className = 'expand-btn';
-    btn.textContent = '▾ Details';
+    btn.textContent = '\u25be Details';
     const detail = document.createElement('div');
     detail.className = 'detail';
-
     btn.addEventListener('click', () => {
       const open = detail.classList.toggle('open');
-      btn.textContent = open ? '▴ Details' : '▾ Details';
+      btn.textContent = (open ? '\u25b4' : '\u25be') + ' Details';
       if (open && !detail.childElementCount) buildDetail(detail, worker);
     });
-
     card.append(btn, detail);
   }
-
   return card;
 }
 
 function buildDetail(detail, worker) {
   const meta = document.createElement('dl');
   meta.className = 'meta';
-
   const row = (label, value) => {
     if (!value && value !== 0) return;
     meta.append(text('dt', label), text('dd', value));
   };
-
   row('Repo', worker.repository);
   row('Agent', worker.agent);
   row('Worktree', worker.worktree);
   row('td', worker.tdTask);
-
   if (worker.pullRequest?.url) {
     const dd = document.createElement('dd');
     const a = document.createElement('a');
-    a.href = worker.pullRequest.url;
-    a.rel = 'noreferrer';
+    a.href = worker.pullRequest.url; a.rel = 'noreferrer';
     a.textContent = worker.pullRequest.state || 'View PR';
-    dd.append(a);
-    meta.append(text('dt', 'PR'), dd);
+    dd.append(a); meta.append(text('dt', 'PR'), dd);
   } else if (worker.pullRequest?.status) {
     row('PR', worker.pullRequest.status);
   }
-
   if (worker.pullRequest?.checks?.length) {
-    const summary = worker.pullRequest.checks.map(c => `${c.name || 'check'}: ${c.conclusion || c.state || c.status || 'pending'}`).join(', ');
-    row('Checks', summary);
+    row('Checks', worker.pullRequest.checks.map(c => `${c.name || 'check'}: ${c.conclusion || c.state || c.status || 'pending'}`).join(', '));
   }
-
   if (worker.pullRequest?.comments?.length) {
-    worker.pullRequest.comments.forEach(c => {
-      row('Comment', `${c.author || ''}: ${c.body || ''}`.trim());
-    });
+    worker.pullRequest.comments.forEach(c => row('Comment', `${c.author || ''}: ${c.body || ''}`.trim()));
   }
-
   [['Message', worker.message], ['Diag', worker.diagnostic], ['Log', worker.log], ['Handoff', worker.handoff], ['td file', worker.td]].forEach(([label, file]) => {
     if (file?.present) row(label, file.summary || 'present');
   });
-
   if (worker.noMistakes?.available || worker.noMistakes?.status) {
     row('no-mistakes', worker.noMistakes?.summary || worker.noMistakes?.status || (worker.noMistakes?.phase ? `${worker.noMistakes.phase} phase` : 'detected'));
   }
-
   if (worker.graphify?.present || worker.graphify?.status) {
     row('Graphify', worker.graphify?.summary || worker.graphify?.status || 'available');
   }
-
   if (worker.ocInject?.responsePending) {
     const at = worker.ocInject.responsePendingAt ? ` since ${new Date(worker.ocInject.responsePendingAt).toLocaleString()}` : '';
     row('oc-inject', `pending${at}`);
@@ -158,9 +134,7 @@ function buildDetail(detail, worker) {
     const at = worker.ocInject.responseAckedAt ? ` ${new Date(worker.ocInject.responseAckedAt).toLocaleString()}` : '';
     row('oc-inject', `acked${at}`);
   }
-
   detail.append(meta);
-
   if (worker.message?.present && worker.message?.summary) {
     const msg = document.createElement('div');
     msg.className = 'message';
@@ -175,7 +149,7 @@ document.querySelectorAll('[data-filter]').forEach(btn => btn.addEventListener('
   render();
 }));
 
-fetch('api/state', { cache: 'no-store' })
-  .then(r => { if (!r.ok) throw new Error('state unavailable'); return r.json(); })
+fetch('api/state', { cache:'no-store' })
+  .then(r => { if (!r.ok) throw new Error('unavailable'); return r.json(); })
   .then(data => { state = data; render(); })
   .catch(() => { workersNode.replaceChildren(text('p', 'Fleet state is temporarily unavailable.', 'empty')); });
