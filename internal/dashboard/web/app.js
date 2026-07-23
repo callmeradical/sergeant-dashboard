@@ -1,6 +1,14 @@
 const workersNode = document.querySelector('#workers');
+const scrim = document.querySelector('#scrim');
+const drawer = document.querySelector('#drawer');
+const drawerClose = document.querySelector('#drawer-close');
+const drawerBody = document.querySelector('#drawer-body');
+const drawerProject = document.querySelector('#drawer-project');
+const drawerBadge = document.querySelector('#drawer-badge');
+
 let state = { workers: [], warnings: [] };
 let filter = 'all';
+let activeCard = null;
 
 const text = (tag, value, className) => {
   const node = document.createElement(tag);
@@ -8,6 +16,42 @@ const text = (tag, value, className) => {
   if (className) node.className = className;
   return node;
 };
+
+// ── Drawer ───────────────────────────────────────────────────────────────────
+
+function openDrawer(worker, cardEl) {
+  const colors = { active:'var(--acid)', stale:'var(--amber)', orphaned:'var(--red)', complete:'var(--muted)' };
+  const statusColor = colors[worker.health] || 'var(--muted)';
+
+  drawerProject.textContent = worker.project || '-';
+  drawerBadge.textContent = worker.health || '-';
+  drawerBadge.style.setProperty('--status', statusColor);
+  drawerBadge.style.borderColor = statusColor;
+  drawerBadge.style.color = statusColor;
+
+  drawerBody.replaceChildren();
+  buildDetail(drawerBody, worker);
+
+  if (activeCard) activeCard.classList.remove('drawer-open');
+  activeCard = cardEl;
+  if (activeCard) activeCard.classList.add('drawer-open');
+
+  drawer.classList.add('open');
+  scrim.classList.add('open');
+  drawer.focus();
+}
+
+function closeDrawer() {
+  drawer.classList.remove('open');
+  scrim.classList.remove('open');
+  if (activeCard) { activeCard.classList.remove('drawer-open'); activeCard = null; }
+}
+
+drawerClose.addEventListener('click', closeDrawer);
+scrim.addEventListener('click', closeDrawer);
+document.addEventListener('keydown', e => { if (e.key === 'Escape') closeDrawer(); });
+
+// ── Render ───────────────────────────────────────────────────────────────────
 
 function render() {
   const attention = state.workers.filter(w => ['stale','orphaned'].includes(w.health));
@@ -32,6 +76,8 @@ function workerCard(worker) {
   const card = document.createElement('article');
   card.className = 'worker';
   card.style.setProperty('--status', colors[worker.health] || 'var(--muted)');
+  card.setAttribute('role', 'button');
+  card.setAttribute('tabindex', '0');
 
   const head = document.createElement('div');
   head.className = 'worker-head';
@@ -70,29 +116,15 @@ function workerCard(worker) {
     card.append(signals);
   }
 
-  const hasDetail = !!(worker.repository || worker.agent || worker.worktree || worker.tdTask ||
-    worker.pullRequest || worker.message?.present || worker.diagnostic?.present ||
-    worker.log?.present || worker.handoff?.present || worker.td?.present ||
-    worker.noMistakes?.available || worker.graphify?.present ||
-    worker.ocInject?.responsePending || worker.ocInject?.responseAcked);
+  // Click anywhere on the tile to open the drawer
+  const openThis = () => openDrawer(worker, card);
+  card.addEventListener('click', openThis);
+  card.addEventListener('keydown', e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); openThis(); } });
 
-  if (hasDetail) {
-    const btn = document.createElement('button');
-    btn.className = 'expand-btn';
-    btn.textContent = '\u25be Details';
-    const detail = document.createElement('div');
-    detail.className = 'detail';
-    btn.addEventListener('click', () => {
-      const open = detail.classList.toggle('open');
-      btn.textContent = (open ? '\u25b4' : '\u25be') + ' Details';
-      if (open && !detail.childElementCount) buildDetail(detail, worker);
-    });
-    card.append(btn, detail);
-  }
   return card;
 }
 
-function buildDetail(detail, worker) {
+function buildDetail(container, worker) {
   const meta = document.createElement('dl');
   meta.className = 'meta';
   const row = (label, value) => {
@@ -134,20 +166,25 @@ function buildDetail(detail, worker) {
     const at = worker.ocInject.responseAckedAt ? ` ${new Date(worker.ocInject.responseAckedAt).toLocaleString()}` : '';
     row('oc-inject', `acked${at}`);
   }
-  detail.append(meta);
+  container.append(meta);
   if (worker.message?.present && worker.message?.summary) {
     const msg = document.createElement('div');
     msg.className = 'message';
     msg.textContent = worker.message.summary;
-    detail.append(msg);
+    container.append(msg);
   }
 }
+
+// ── Filters ──────────────────────────────────────────────────────────────────
 
 document.querySelectorAll('[data-filter]').forEach(btn => btn.addEventListener('click', () => {
   filter = btn.dataset.filter;
   document.querySelectorAll('[data-filter]').forEach(b => b.classList.toggle('selected', b === btn));
+  closeDrawer();
   render();
 }));
+
+// ── Boot ─────────────────────────────────────────────────────────────────────
 
 fetch('api/state', { cache:'no-store' })
   .then(r => { if (!r.ok) throw new Error('unavailable'); return r.json(); })

@@ -37,6 +37,20 @@
     </section>
   </main>
   <footer>LOCAL TELEMETRY <span>NO COMMAND CHANNEL</span></footer>
+
+  <!-- Right-side drawer overlay -->
+  <div class="scrim" id="scrim" aria-hidden="true"></div>
+  <aside class="drawer" id="drawer" role="dialog" aria-modal="true" aria-label="Worker detail">
+    <div class="drawer-header">
+      <div class="drawer-title">
+        <span id="drawer-project" class="drawer-project"></span>
+        <span id="drawer-badge" class="badge"></span>
+      </div>
+      <button class="drawer-close" id="drawer-close" aria-label="Close">&#x2715;</button>
+    </div>
+    <div class="drawer-body" id="drawer-body"></div>
+  </aside>
+
   <script src="app.js"></script>
 </body>
 </html>

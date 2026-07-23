@@ -1,4 +1,4 @@
-:root { --ink:#e8eddf; --muted:#899287; --panel:#151b19; --line:#303a34; --acid:#c7f464; --amber:#ffb84d; --red:#ff6b5f; --bg:#0b0f0e; }
+:root { --ink:#e8eddf; --muted:#899287; --panel:#151b19; --line:#303a34; --acid:#c7f464; --amber:#ffb84d; --red:#ff6b5f; --bg:#0b0f0e; --drawer-w:420px; }
 * { box-sizing:border-box; }
 body { margin:0; min-height:100vh; background:var(--bg); color:var(--ink); font:15px/1.55 "Ubuntu Mono",ui-monospace,Consolas,monospace; }
 .grain { position:fixed; inset:0; pointer-events:none; opacity:.035; background-image:url("data:image/svg+xml,%3Csvg viewBox='0 0 180 180' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.9' numOctaves='3'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E"); }
@@ -20,26 +20,40 @@ button { color:var(--muted); background:transparent; border:1px solid var(--line
 button.selected { color:var(--bg); border-color:var(--acid); background:var(--acid); }
 .warnings { margin:0 0 16px; padding:12px 15px; color:var(--amber); border:1px solid #694e24; background:#211b11; }
 .workers { display:grid; grid-template-columns:repeat(auto-fit,minmax(300px,1fr)); gap:12px; }
-.worker { position:relative; overflow:hidden; padding:20px 22px 16px; border:1px solid var(--line); background:linear-gradient(145deg,#171d1b,#101513); }
+
+/* Worker tile — minimal, clickable */
+.worker { position:relative; overflow:hidden; padding:20px 22px 16px; border:1px solid var(--line); background:linear-gradient(145deg,#171d1b,#101513); cursor:pointer; transition:border-color .15s, box-shadow .15s; }
 .worker::before { content:""; position:absolute; inset:0 auto 0 0; width:3px; background:var(--status,var(--muted)); }
+.worker:hover { border-color:color-mix(in srgb, var(--status,var(--muted)) 40%, var(--line)); box-shadow:0 0 0 1px color-mix(in srgb, var(--status,var(--muted)) 15%, transparent); }
+.worker.drawer-open { border-color:var(--status,var(--acid)); box-shadow:0 0 0 1px color-mix(in srgb, var(--status,var(--acid)) 30%, transparent); }
 .worker-head { display:flex; justify-content:space-between; align-items:flex-start; margin-bottom:4px; }
 .worker h3 { margin:0; font:700 26px/1.1 Ubuntu,Cantarell,system-ui,sans-serif; }
 .badge { padding:3px 7px; border:1px solid var(--status); color:var(--status); font:600 12px/1 Ubuntu,Cantarell,system-ui,sans-serif; text-transform:uppercase; letter-spacing:.03em; white-space:nowrap; }
 .worker-sub { color:var(--muted); font-size:14px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; margin-bottom:10px; }
 .worker-line { font-size:14px; color:var(--muted); margin-bottom:14px; }
 .worker-line strong { color:var(--ink); }
-.signals { display:flex; flex-wrap:wrap; gap:5px; margin-bottom:10px; }
+.signals { display:flex; flex-wrap:wrap; gap:5px; }
 .signal { padding:3px 6px; border:1px solid #53662e; color:var(--acid); font:600 12px/1 Ubuntu,Cantarell,system-ui,sans-serif; letter-spacing:.03em; }
-.expand-btn { background:transparent; border:none; padding:0; color:var(--muted); font:13px/1 "Ubuntu Mono",ui-monospace,Consolas,monospace; cursor:pointer; letter-spacing:0; display:inline-flex; align-items:center; gap:4px; }
-.expand-btn:hover { color:var(--ink); }
-.detail { display:none; margin-top:14px; padding-top:14px; border-top:1px solid var(--line); }
-.detail.open { display:block; }
-.meta { display:grid; grid-template-columns:80px 1fr; gap:6px; margin:0; font-size:13px; }
-.meta dt { color:var(--muted); }
+
+/* Scrim */
+.scrim { position:fixed; inset:0; background:rgba(0,0,0,.55); backdrop-filter:blur(1px); opacity:0; pointer-events:none; transition:opacity .25s ease; z-index:100; }
+.scrim.open { opacity:1; pointer-events:auto; }
+
+/* Right-side drawer */
+.drawer { position:fixed; top:0; right:0; bottom:0; width:var(--drawer-w); max-width:100vw; background:#111713; border-left:1px solid var(--line); display:flex; flex-direction:column; transform:translateX(100%); transition:transform .25s ease; z-index:101; }
+.drawer.open { transform:translateX(0); }
+.drawer-header { display:flex; align-items:center; justify-content:space-between; gap:12px; padding:22px 20px 18px; border-bottom:1px solid var(--line); flex-shrink:0; }
+.drawer-title { display:flex; align-items:center; gap:10px; min-width:0; }
+.drawer-project { font:700 20px/1.1 Ubuntu,Cantarell,system-ui,sans-serif; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.drawer-close { border:none; background:transparent; color:var(--muted); font-size:18px; padding:4px 8px; cursor:pointer; line-height:1; flex-shrink:0; }
+.drawer-close:hover { color:var(--ink); }
+.drawer-body { flex:1; overflow-y:auto; padding:20px; }
+.meta { display:grid; grid-template-columns:90px 1fr; gap:6px 12px; margin:0; font-size:13px; }
+.meta dt { color:var(--muted); padding-top:1px; }
 .meta dd { margin:0; overflow-wrap:anywhere; }
-.message { margin:10px 0 0; padding:8px 10px; border-left:2px solid var(--amber); background:#211b11; color:#e8c98f; font-size:13px; }
+.message { margin:16px 0 0; padding:10px 12px; border-left:2px solid var(--amber); background:#211b11; color:#e8c98f; font-size:13px; }
 a { color:var(--acid); text-underline-offset:3px; }
 .empty { color:var(--muted); padding:50px 0; }
 footer { display:flex; justify-content:space-between; margin-top:60px; padding:24px 0 40px; border-top:1px solid var(--line); color:var(--muted); font:600 12px/1 Ubuntu,Cantarell,system-ui,sans-serif; letter-spacing:.03em; }
 footer span { color:var(--acid); }
-@media (max-width:700px) { header { min-height:140px; align-items:start; flex-direction:column; gap:25px; } .overview { grid-template-columns:repeat(3,1fr); } .overview p { grid-column:1/-1; justify-content:start; } .toolbar { align-items:start; flex-direction:column; gap:15px; } header,main,footer { width:min(100% - 24px,1180px); } }
+@media (max-width:700px) { header { min-height:140px; align-items:start; flex-direction:column; gap:25px; } .overview { grid-template-columns:repeat(3,1fr); } .overview p { grid-column:1/-1; justify-content:start; } .toolbar { align-items:start; flex-direction:column; gap:15px; } header,main,footer { width:min(100% - 24px,1180px); } :root { --drawer-w:100vw; } }
