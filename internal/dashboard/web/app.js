@@ -44,10 +44,24 @@ function openDrawer(worker, cardEl) {
 }
 
 function closeDrawer() {
+  const trigger = activeCard;
   drawer.classList.remove('open');
   scrim.classList.remove('open');
   if (activeCard) { activeCard.classList.remove('drawer-open'); activeCard = null; }
+  // Restore focus to the card that opened the drawer.
+  if (trigger) trigger.focus();
 }
+
+// Focus trap: when the drawer is open, keep Tab cycling within it.
+drawer.addEventListener('keydown', e => {
+  if (!drawer.classList.contains('open') || e.key !== 'Tab') return;
+  const focusable = [...drawer.querySelectorAll('a[href], button, [tabindex="0"]')];
+  if (!focusable.length) return;
+  const first = focusable[0];
+  const last = focusable[focusable.length - 1];
+  if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last.focus(); }
+  else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus(); }
+});
 
 drawerClose.addEventListener('click', closeDrawer);
 scrim.addEventListener('click', closeDrawer);
@@ -55,8 +69,12 @@ document.addEventListener('keydown', e => { if (e.key === 'Escape') closeDrawer(
 
 // ── Render ───────────────────────────────────────────────────────────────────
 
+// isAttention returns true for actionable workers: legacy attention states,
+// orphaned records, and active workers in a waiting/blocked lifecycle state.
+const isAttention = w => ATTENTION_HEALTH.has(w.health) || (w.health === 'active' && (w.status === 'needs_input' || w.status === 'blocked'));
+
 function render() {
-  const attention = state.workers.filter(w => ATTENTION_HEALTH.has(w.health));
+  const attention = state.workers.filter(isAttention);
   document.querySelector('#total').textContent = state.workers.length;
   document.querySelector('#active').textContent = state.workers.filter(w => w.health === 'active').length;
   document.querySelector('#attention').textContent = attention.length;
@@ -67,7 +85,7 @@ function render() {
   workersNode.replaceChildren();
   const shown = state.workers.filter(w =>
     filter === 'all' ||
-    (filter === 'attention' ? ATTENTION_HEALTH.has(w.health) : w.health === filter)
+    (filter === 'attention' ? isAttention(w) : w.health === filter)
   );
   if (!shown.length) workersNode.append(text('p', 'No workers match this view.', 'empty'));
   shown.forEach(w => workersNode.append(workerCard(w)));
@@ -79,7 +97,8 @@ function workerCard(worker) {
   card.style.setProperty('--status', HEALTH_COLORS[worker.health] || 'var(--muted)');
   card.setAttribute('role', 'button');
   card.setAttribute('tabindex', '0');
-  card.setAttribute('aria-label', `${worker.project || 'worker'}, health: ${worker.health || 'unknown'}`);
+  const label = [worker.project, worker.health, worker.status, worker.task].filter(Boolean).join(', ');
+  card.setAttribute('aria-label', `Open details: ${label}`);
 
   const head = document.createElement('div');
   head.className = 'worker-head';
@@ -167,7 +186,11 @@ function buildDetail(container, worker) {
     const a = document.createElement('a');
     a.href = worker.pullRequest.url; a.rel = 'noreferrer';
     a.textContent = worker.pullRequest.state || 'View PR';
-    dd.append(a); meta.append(text('dt', 'PR'), dd);
+    dd.append(a);
+    if (worker.pullRequest?.status) {
+      dd.append(document.createTextNode(' (' + worker.pullRequest.status + ')'));
+    }
+    meta.append(text('dt', 'PR'), dd);
   } else if (worker.pullRequest?.status) {
     row('PR', worker.pullRequest.status);
   }
@@ -198,7 +221,7 @@ function buildDetail(container, worker) {
   }
   if (worker.ocInject?.responsePending) {
     const at = worker.ocInject.responsePendingAt ? ` since ${new Date(worker.ocInject.responsePendingAt).toLocaleString()}` : '';
-    row('oc-inject', `pending${at}`);
+    row('oc-inject', `response pending${at}`);
   } else if (worker.ocInject?.responseAcked) {
     const at = worker.ocInject.responseAckedAt ? ` ${new Date(worker.ocInject.responseAckedAt).toLocaleString()}` : '';
     row('oc-inject', `acked${at}`);

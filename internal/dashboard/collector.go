@@ -26,14 +26,19 @@ const (
 var processProbeSlots = make(chan struct{}, 2*maxConcurrentWorkers)
 
 type Collector struct {
-	FleetRoot    string
-	StaleAfter   time.Duration
-	Now          func() time.Time
-	Run          Runner
-	ProbeTimeout time.Duration
+	FleetRoot         string
+	StaleAfter        time.Duration
+	Now               func() time.Time
+	Run               Runner
+	ProbeTimeout      time.Duration
+	InspectSupervisor SupervisorInspector
 }
 
 type Runner func(ctx context.Context, dir, name string, args ...string) ([]byte, error)
+
+// SupervisorInspector verifies whether a tmux pane is running the expected
+// sgt-worker process for the given fleet state directory.
+type SupervisorInspector func(ctx context.Context, pane, stateDir string) (bool, error)
 
 type State struct {
 	CollectedAt time.Time `json:"collectedAt"`
@@ -137,7 +142,7 @@ func (c Collector) Collect(ctx context.Context) State {
 			if !project.IsDir() {
 				continue
 			}
-			worker, warnings := collectWorker(filepath.Join(c.FleetRoot, task.Name(), project.Name()), task.Name(), project.Name(), now, staleAfter)
+			worker, warnings := c.collectWorker(ctx, filepath.Join(c.FleetRoot, task.Name(), project.Name()), task.Name(), project.Name(), now, staleAfter)
 			state.Workers = append(state.Workers, worker)
 			state.Warnings = append(state.Warnings, warnings...)
 		}
@@ -385,7 +390,7 @@ func (buffer *boundedBuffer) Write(data []byte) (int, error) {
 	return written, nil
 }
 
-func collectWorker(dir, task, project string, now time.Time, staleAfter time.Duration) (Worker, []string) {
+func (c Collector) collectWorker(ctx context.Context, dir, task, project string, now time.Time, staleAfter time.Duration) (Worker, []string) {
 	worker := Worker{Task: task, Project: project, Health: "orphaned"}
 	warnings := []string{}
 	var err error
@@ -427,17 +432,126 @@ func collectWorker(dir, task, project string, now time.Time, staleAfter time.Dur
 	if !worker.enrichable {
 		return worker, warnings
 	}
-	if worker.Status == "needs_input" || worker.Status == "blocked" {
-		worker.Health = "attention"
-	} else {
-		activityAt := latestTime(worker.UpdatedAt, latestTime(worker.Log.UpdatedAt, latestTime(worker.Message.UpdatedAt, worker.Diagnostic.UpdatedAt)))
-		if !activityAt.IsZero() && now.Sub(activityAt) > staleAfter {
-			worker.Health = "stale"
-		} else if worker.Status != "" {
-			worker.Health = "active"
+
+	activityAt := latestTime(worker.UpdatedAt, latestTime(worker.Log.UpdatedAt, latestTime(worker.Message.UpdatedAt, worker.Diagnostic.UpdatedAt)))
+
+	// Classify health using supervisor identity when a pane file is present.
+	pane, _, _ := readScalarWithTime(filepath.Join(dir, "pane"))
+	if pane != "" {
+		inspect := c.InspectSupervisor
+		if inspect == nil {
+			inspect = inspectSupervisor
 		}
+		live, err := inspect(ctx, pane, dir)
+		if err != nil {
+			// Inspection unavailable; fall back to timestamp-based classification.
+			worker.Health = ageHealth(activityAt, now, staleAfter)
+			return worker, warnings
+		}
+		if live {
+			worker.Health = "active"
+			return worker, warnings
+		}
+		// Dead pane: stale if timestamp is old, otherwise orphaned.
+		worker.Health = ageHealth(activityAt, now, staleAfter)
+		return worker, warnings
+	}
+
+	// No pane file: classify by status timestamp alone.
+	if !activityAt.IsZero() && now.Sub(activityAt) > staleAfter {
+		worker.Health = "stale"
+	} else if worker.Status != "" {
+		worker.Health = "active"
 	}
 	return worker, warnings
+}
+
+// ageHealth returns "stale" if activityAt is more than staleAfter in the past,
+// and "orphaned" otherwise. Used when a supervisor pane is unavailable or dead.
+func ageHealth(activityAt, now time.Time, staleAfter time.Duration) string {
+	if !activityAt.IsZero() && now.Sub(activityAt) > staleAfter {
+		return "stale"
+	}
+	return "orphaned"
+}
+
+// inspectSupervisor is the real supervisor inspector that queries tmux.
+func inspectSupervisor(ctx context.Context, pane, stateDir string) (bool, error) {
+	output, err := runCommand(ctx, "", "tmux", "display-message", "-p", "-t", pane, "#{pane_dead}|#{pane_start_command}")
+	if err != nil {
+		return false, err
+	}
+	return ParseSupervisorEvidence(strings.TrimSpace(string(output)), stateDir)
+}
+
+// ParseSupervisorEvidence parses tmux pane_dead and pane_start_command output
+// to determine whether the pane is running an sgt-worker process for stateDir.
+// output has the form "<0|1>|<pane_start_command>".
+func ParseSupervisorEvidence(output, stateDir string) (bool, error) {
+	dead, command, found := strings.Cut(output, "|")
+	if !found || (dead != "0" && dead != "1") {
+		return false, fmt.Errorf("invalid supervisor evidence")
+	}
+	if dead != "0" {
+		return false, nil
+	}
+	fields, err := shellFields(command)
+	if err != nil {
+		return false, err
+	}
+	// sgt-worker <stateDir> [<worktree> [<agent> [<initial_message>]]]
+	if len(fields) >= 2 && filepath.Base(fields[0]) == "sgt-worker" && fields[1] == stateDir {
+		return true, nil
+	}
+	return false, nil
+}
+
+// shellFields splits a POSIX-shell-style command string into fields,
+// handling single quotes, double quotes, and backslash escapes.
+func shellFields(command string) ([]string, error) {
+	fields := []string{}
+	var field strings.Builder
+	quote := rune(0)
+	escaped := false
+	flush := func() {
+		if field.Len() > 0 {
+			fields = append(fields, field.String())
+			field.Reset()
+		}
+	}
+	for _, character := range command {
+		if escaped {
+			field.WriteRune(character)
+			escaped = false
+			continue
+		}
+		if character == '\\' && quote != '\'' {
+			escaped = true
+			continue
+		}
+		if quote != 0 {
+			if character == quote {
+				quote = 0
+			} else {
+				field.WriteRune(character)
+			}
+			continue
+		}
+		if character == '\'' || character == '"' {
+			quote = character
+			continue
+		}
+		if character == ' ' || character == '\t' || character == '\n' {
+			flush()
+			continue
+		}
+		field.WriteRune(character)
+	}
+	if escaped || quote != 0 {
+		return nil, fmt.Errorf("invalid supervisor command")
+	}
+	flush()
+	return fields, nil
 }
 
 func readScalarWithTime(path string) (string, time.Time, error) {

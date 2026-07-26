@@ -104,10 +104,41 @@ var (
 	secretValue     = regexp.MustCompile(`(?i)(bearer\s+)[^\s,;]+|((?:api[_-]?key|credential|password|secret|token)\s*[:=]\s*)[^\s,;]+|AKIA[A-Z0-9]{16}|gh[pousr]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,}|npm_[A-Za-z0-9]{20,}|sk-[A-Za-z0-9_-]{20,}|xox[baprs]-[A-Za-z0-9-]{20,}`)
 )
 
+// isOperational reports whether a worker is part of the operational set:
+// exact-supervisor-verified live workers (active) and actionable non-terminal
+// records (orphaned). Completed, stale historical, and unknown malformed
+// inventory are excluded from the overview and board.
+func isOperational(health string) bool {
+	return health == "active" || health == "orphaned"
+}
+
 func projectState(state State) projectedState {
 	workerCount := min(len(state.Workers), maxProjectedWorkers)
 	warningCount := min(len(state.Warnings), maxProjectedWarnings)
 	projected := projectedState{CollectedAt: state.CollectedAt, Workers: make([]projectedWorker, 0, workerCount), Warnings: make([]string, 0, warningCount+1)}
+
+	// Count excluded inventory for diagnostic warnings.
+	var completeCount, staleCount, unknownCount int
+	for _, worker := range state.Workers[:workerCount] {
+		switch worker.Health {
+		case "complete":
+			completeCount++
+		case "stale":
+			staleCount++
+		case "unknown":
+			unknownCount++
+		}
+	}
+	if completeCount > 0 {
+		projected.Warnings = append(projected.Warnings, fmt.Sprintf("%d completed worker(s) excluded from overview", completeCount))
+	}
+	if staleCount > 0 {
+		projected.Warnings = append(projected.Warnings, fmt.Sprintf("%d stale worker(s) excluded from overview", staleCount))
+	}
+	if unknownCount > 0 {
+		projected.Warnings = append(projected.Warnings, fmt.Sprintf("%d unknown worker(s) excluded from overview", unknownCount))
+	}
+
 	for _, warning := range state.Warnings[:warningCount] {
 		projected.Warnings = append(projected.Warnings, RedactText(warning))
 	}
@@ -115,6 +146,9 @@ func projectState(state State) projectedState {
 		projected.Warnings = append(projected.Warnings, "projection truncated at safety limit")
 	}
 	for _, worker := range state.Workers[:workerCount] {
+		if !isOperational(worker.Health) {
+			continue
+		}
 		projected.Workers = append(projected.Workers, projectedWorker{
 			Task: RedactText(worker.Task), Project: RedactText(worker.Project), Repository: RedactText(worker.Repository), Status: RedactText(worker.Status), Health: RedactText(worker.Health), Agent: RedactText(worker.Agent), Branch: RedactText(worker.Branch), TDTask: validTDTask(worker.TDTask), Worktree: RedactText(worker.Worktree), UpdatedAt: worker.UpdatedAt,
 			Message: projectFile(worker.Message), Diagnostic: projectFile(worker.Diagnostic), Log: projectFile(worker.Log), Handoff: projectFile(worker.Handoff), TD: projectFile(worker.TD), Graphify: projectFile(worker.Graphify), PullRequest: projectPullRequest(worker.PullRequest), NoMistakes: projectTool(worker.NoMistakes),

@@ -140,7 +140,6 @@ async function inspect(target, viewport) {
       active: document.querySelector('#active').textContent,
       attention: document.querySelector('#attention').textContent,
       warnings: document.querySelector('#warnings').textContent,
-      links: [...document.querySelectorAll('#workers a')].map(link => link.href),
       toolbarDirection: getComputedStyle(document.querySelector('.toolbar')).flexDirection,
       viewportWidth: innerWidth,
       documentWidth: document.documentElement.scrollWidth,
@@ -157,12 +156,35 @@ for (const viewport of ['1280,900', '390,844']) {
   assert.equal(rendered.active, '1');
   assert.equal(rendered.attention, '1');
   assert.equal(rendered.warnings, 'source delayed token=[REDACTED]');
-  for (const expected of ['raw-private-task', 'raw-private-project', 'secret-branch', '/secret/worktree', 'approval needed', 'worker recovered', 'tests passed', 'remaining: open PR', 'private check name: SUCCESS', 'available truncated', 'review passed', 'Collector connects fleet state', 'response pending', 'unavailable', 'missing', 'message', 'graphify', 'no-mistakes', 'oc-inject']) assert.match(rendered.text, new RegExp(expected));
+  // Items visible in worker cards without opening the drawer.
+  for (const expected of ['raw-private-task', 'raw-private-project', 'secret-branch', 'message', 'graphify', 'no-mistakes', 'oc-inject']) assert.match(rendered.text, new RegExp(expected));
   for (const forbidden of ['token=secret']) assert.doesNotMatch(rendered.text, new RegExp(forbidden));
-  assert.deepEqual(rendered.links, ['https://github.com/acme/widget/pull/7', 'https://github.com/acme/widget/pull/7#issuecomment-1']);
-  assert.match(rendered.text, /td-123/);
   assert.ok(rendered.documentWidth <= rendered.viewportWidth, `horizontal overflow at ${viewport}`);
   assert.equal(rendered.toolbarDirection, viewport.startsWith('390') ? 'column' : 'row');
+}
+
+// Verify drawer content by clicking worker cards.
+const drawerPage = await openPage('valid', '1280,900');
+try {
+  // Click first card (active worker) and verify drawer detail.
+  await drawerPage.evaluate(`document.querySelectorAll('.worker')[0].click()`);
+  await delay(100);
+  const firstDrawer = await drawerPage.evaluate(`document.querySelector('#drawer-body').textContent`);
+  for (const expected of ['/secret/worktree', 'td-123', 'approval needed', 'worker recovered', 'tests passed', 'remaining: open PR', 'private check name: SUCCESS', 'available truncated', 'review passed', 'Collector connects fleet state', 'response pending']) {
+    assert.match(firstDrawer, new RegExp(expected), `first drawer missing: ${expected}`);
+  }
+  // Verify PR and comment links are rendered in the drawer.
+  const drawerLinks = await drawerPage.evaluate(`[...document.querySelectorAll('#drawer-body a')].map(a => a.href)`);
+  assert.deepEqual(drawerLinks, ['https://github.com/acme/widget/pull/7', 'https://github.com/acme/widget/pull/7#issuecomment-1']);
+  // Click second card (orphaned worker) and verify its drawer detail.
+  await drawerPage.evaluate(`document.querySelectorAll('.worker')[1].click()`);
+  await delay(100);
+  const secondDrawer = await drawerPage.evaluate(`document.querySelector('#drawer-body').textContent`);
+  for (const expected of ['unavailable', 'missing']) {
+    assert.match(secondDrawer, new RegExp(expected), `second drawer missing: ${expected}`);
+  }
+} finally {
+  await drawerPage.close();
 }
 
 const filteredPage = await openPage('valid', '1280,900');
@@ -172,7 +194,7 @@ try {
     return { cards: document.querySelectorAll('.worker').length, text: document.querySelector('#workers').textContent };
   })()`);
   assert.equal(filtered.cards, 1);
-  assert.match(filtered.text, /stale/);
+  assert.match(filtered.text, /orphaned/);
   assert.doesNotMatch(filtered.text, /in_progress/);
 } finally {
   await filteredPage.close();

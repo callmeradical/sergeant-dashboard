@@ -309,6 +309,121 @@ func TestStateAPIProjectsBlockedLifecycleStatus(t *testing.T) {
 	}
 }
 
+// TestStateAPIProjectsOnlyOperationalWorkersFromMixedHistory reproduces the
+// 154-record live failure: the API should return only the operational set
+// (verified active workers and actionable orphaned records), not the full
+// retained fleet inventory.
+func TestStateAPIProjectsOnlyOperationalWorkersFromMixedHistory(t *testing.T) {
+	root := t.TempDir()
+	now := time.Date(2026, 7, 26, 12, 0, 0, 0, time.UTC)
+	staleAfter := 30 * time.Minute
+
+	mkWorker := func(task, project, status, pane string, worktree bool, age time.Duration) {
+		dir := filepath.Join(root, task, project)
+		mustMkdirAll(t, dir)
+		writeFile(t, filepath.Join(dir, "status"), status+"\n")
+		setModTime(t, filepath.Join(dir, "status"), now.Add(-age))
+		if pane != "" {
+			writeFile(t, filepath.Join(dir, "pane"), pane+"\n")
+		}
+		if worktree {
+			wt := filepath.Join(root, task+"-wt")
+			mustMkdirAll(t, wt)
+			writeFile(t, filepath.Join(dir, "worktree"), wt+"\n")
+		}
+	}
+
+	// 93 stale workers: in_progress, existing worktree, old status, dead/missing pane.
+	// Includes one explicit reused-pane (prefix-colliding with an active worker's pane).
+	mkWorker("stale-reused-pane", "api", "in_progress", "pane-live", true, staleAfter+time.Minute)
+	for i := 1; i < 93; i++ {
+		mkWorker(fmt.Sprintf("stale-%03d", i), "api", "in_progress", "", true, staleAfter+time.Minute)
+	}
+
+	// 1 active worker: in_progress, existing worktree, old status but LIVE pane.
+	mkWorker("active-live", "api", "in_progress", "pane-live", true, staleAfter+time.Minute)
+
+	// 43 complete workers: terminal status, worktree cleaned up.
+	for i := 0; i < 40; i++ {
+		mkWorker(fmt.Sprintf("complete-done-%03d", i), "api", "done", "", false, time.Hour)
+	}
+	for i := 0; i < 3; i++ {
+		mkWorker(fmt.Sprintf("complete-failed-%03d", i), "api", "failed: command error", "", false, time.Hour)
+	}
+
+	// 7 orphaned workers: non-terminal status, worktree missing.
+	for i := 0; i < 3; i++ {
+		mkWorker(fmt.Sprintf("orphaned-needs-input-%03d", i), "api", "needs_input", "", false, time.Hour)
+	}
+	for i := 0; i < 2; i++ {
+		mkWorker(fmt.Sprintf("orphaned-blocked-%03d", i), "api", "blocked", "", false, time.Hour)
+	}
+	for i := 0; i < 2; i++ {
+		mkWorker(fmt.Sprintf("orphaned-explicit-%03d", i), "api", "orphaned", "", false, time.Hour)
+	}
+
+	// 10 unknown workers: invalid/malformed status.
+	for i := 0; i < 10; i++ {
+		mkWorker(fmt.Sprintf("unknown-%03d", i), "api", "invalid-status", "", false, time.Hour)
+	}
+
+	// Total: 93 stale + 1 active + 43 complete + 7 orphaned + 10 unknown = 154 workers.
+
+	livePane := "pane-live"
+	collector := dashboard.Collector{
+		FleetRoot:  root,
+		Now:        func() time.Time { return now },
+		StaleAfter: staleAfter,
+		InspectSupervisor: func(_ context.Context, pane, stateDir string) (bool, error) {
+			// Only the worker whose stateDir ends in "active-live/api" has a live pane.
+			return pane == livePane && strings.HasSuffix(stateDir, "active-live/api"), nil
+		},
+	}
+
+	handler := dashboard.NewHandler(collector)
+	response := request(t, handler, http.MethodGet, "/sergeant/api/state")
+	if response.Code != http.StatusOK {
+		t.Fatalf("state response = %d %s", response.Code, response.Body.String())
+	}
+
+	var state struct {
+		Workers []struct {
+			Task   string `json:"task"`
+			Health string `json:"health"`
+		} `json:"workers"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &state); err != nil {
+		t.Fatalf("decode state: %v: %s", err, response.Body.String())
+	}
+
+	var active, orphaned int
+	for _, w := range state.Workers {
+		switch w.Health {
+		case "active":
+			active++
+		case "orphaned":
+			orphaned++
+		default:
+			t.Errorf("non-operational worker in response: task=%s health=%s", w.Task, w.Health)
+		}
+	}
+	if got := len(state.Workers); got != 8 {
+		t.Errorf("operational workers = %d, want 8 (1 active + 7 orphaned); got health dist active=%d orphaned=%d", got, active, orphaned)
+	}
+	if active != 1 {
+		t.Errorf("active workers = %d, want 1 (pane-verified live supervisor)", active)
+	}
+	if orphaned != 7 {
+		t.Errorf("orphaned workers = %d, want 7 (actionable non-terminal records)", orphaned)
+	}
+	// Stale-with-reused-pane must not be active: prefix-colliding pane does not verify identity.
+	for _, w := range state.Workers {
+		if w.Task == "stale-reused-pane" {
+			t.Errorf("stale worker with reused pane appeared in operational set with health=%s", w.Health)
+		}
+	}
+}
+
 func TestEmbeddedApplicationRendersBrowserBehavior(t *testing.T) {
 	state := dashboard.State{
 		CollectedAt: time.Date(2026, 7, 21, 12, 0, 0, 0, time.UTC),
@@ -328,7 +443,7 @@ func TestEmbeddedApplicationRendersBrowserBehavior(t *testing.T) {
 				NoMistakes: dashboard.ToolStatus{Available: true, Phase: "review", Summary: "review passed"}, Graphify: dashboard.FileMetadata{Present: true, Summary: "Collector connects fleet state"},
 				OCInject: dashboard.AuditMetadata{ResponsePending: true},
 			},
-			{Task: "stale-task", Project: "stale-project", Status: "blocked", Health: "stale", TDTask: "invalid task", NoMistakes: dashboard.ToolStatus{Status: "unavailable"}, Graphify: dashboard.FileMetadata{Status: "missing"}},
+			{Task: "orphaned-task", Project: "orphaned-project", Status: "blocked", Health: "orphaned", TDTask: "invalid task", NoMistakes: dashboard.ToolStatus{Status: "unavailable"}, Graphify: dashboard.FileMetadata{Status: "missing"}},
 		},
 		Warnings: []string{"source delayed token=secret"},
 	}

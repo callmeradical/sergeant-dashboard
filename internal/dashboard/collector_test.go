@@ -3,6 +3,7 @@ package dashboard_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -741,8 +742,8 @@ func TestCollectorClassifiesLifecycleValues(t *testing.T) {
 		wantHealth string
 	}{
 		{name: "in-progress", value: "in_progress", wantStatus: "in_progress", wantHealth: "active"},
-		{name: "needs-input", value: "needs_input", wantStatus: "needs_input", wantHealth: "attention"},
-		{name: "blocked", value: "blocked", wantStatus: "blocked", wantHealth: "attention"},
+		{name: "needs-input", value: "needs_input", wantStatus: "needs_input", wantHealth: "active"},
+		{name: "blocked", value: "blocked", wantStatus: "blocked", wantHealth: "active"},
 		{name: "done", value: "done", wantStatus: "done", wantHealth: "recycled"},
 		{name: "failed", value: "failed", wantStatus: "failed", wantHealth: "recycled"},
 		{name: "failed-with-reason", value: "failed: command exited", wantStatus: "failed: command exited", wantHealth: "recycled"},
@@ -756,7 +757,7 @@ func TestCollectorClassifiesLifecycleValues(t *testing.T) {
 		worker := filepath.Join(root, test.name, "api")
 		mustMkdirAll(t, worker)
 		writeFile(t, filepath.Join(worker, "status"), test.value+"\n")
-		if test.wantHealth == "active" || test.wantHealth == "attention" {
+		if test.wantHealth == "active" {
 			writeFile(t, filepath.Join(worker, "worktree"), worktree+"\n")
 		}
 		setModTime(t, filepath.Join(worker, "status"), now.Add(-time.Minute))
@@ -799,7 +800,7 @@ func TestCollectorToleratesMissingFleetRoot(t *testing.T) {
 	}
 }
 
-func TestCollectorClassifiesBlockedAndNeedsInputAsAttention(t *testing.T) {
+func TestCollectorClassifiesBlockedAndNeedsInputWithoutSupervisorAsActive(t *testing.T) {
 	root := t.TempDir()
 	worktree := filepath.Join(root, "worktree")
 	mustMkdirAll(t, worktree)
@@ -809,8 +810,8 @@ func TestCollectorClassifiesBlockedAndNeedsInputAsAttention(t *testing.T) {
 		status     string
 		wantHealth string
 	}{
-		{name: "blocked", status: "blocked", wantHealth: "attention"},
-		{name: "needs-input", status: "needs_input", wantHealth: "attention"},
+		{name: "blocked", status: "blocked", wantHealth: "active"},
+		{name: "needs-input", status: "needs_input", wantHealth: "active"},
 		{name: "in-progress", status: "in_progress", wantHealth: "active"},
 	}
 	for _, test := range tests {
@@ -835,6 +836,143 @@ func TestCollectorClassifiesBlockedAndNeedsInputAsAttention(t *testing.T) {
 		if got := byTask[test.name].Health; got != test.wantHealth {
 			t.Errorf("%s health = %q, want %q", test.name, got, test.wantHealth)
 		}
+	}
+}
+
+func TestParseSupervisorEvidenceMatchesSgtWorkerByStateDir(t *testing.T) {
+	stateDir := "/home/lars/.local/share/sergeant/fleet/task-abc/sergeant-dashboard"
+	for _, test := range []struct {
+		name    string
+		output  string
+		want    bool
+		wantErr bool
+	}{
+		{name: "live exact", output: "0|sgt-worker " + stateDir + " /worktree opencode message", want: true},
+		{name: "live quoted", output: "0|'sgt-worker' '" + stateDir + "' /worktree", want: true},
+		{name: "dead pane", output: "1|sgt-worker " + stateDir + " /worktree", want: false},
+		{name: "prefix collision", output: "0|sgt-worker " + stateDir + "-extra /worktree", want: false},
+		{name: "wrong binary", output: "0|sgt-worker-old " + stateDir + " /worktree", want: false},
+		{name: "unrelated command", output: "0|echo sgt-worker " + stateDir, want: false},
+		{name: "malformed no pipe", output: "sgt-worker " + stateDir, wantErr: true},
+		{name: "invalid dead flag", output: "2|sgt-worker " + stateDir, wantErr: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			live, err := dashboard.ParseSupervisorEvidence(test.output, stateDir)
+			if (err != nil) != test.wantErr {
+				t.Fatalf("ParseSupervisorEvidence(%q) error = %v, wantErr = %t", test.output, err, test.wantErr)
+			}
+			if !test.wantErr && live != test.want {
+				t.Fatalf("ParseSupervisorEvidence(%q) = %t, want %t", test.output, live, test.want)
+			}
+		})
+	}
+}
+
+func TestCollectorFallsBackToTimestampWhenSupervisorInspectionErrors(t *testing.T) {
+	root := t.TempDir()
+	now := time.Date(2026, 7, 26, 12, 0, 0, 0, time.UTC)
+	tests := []struct {
+		task       string
+		statusAge  time.Duration
+		logAge     time.Duration
+		wantHealth string
+	}{
+		{task: "fresh-status", statusAge: time.Minute, wantHealth: "orphaned"},
+		{task: "fresh-log", statusAge: time.Hour, logAge: time.Minute, wantHealth: "orphaned"},
+		{task: "stale", statusAge: time.Hour, wantHealth: "stale"},
+	}
+	for _, test := range tests {
+		dir := filepath.Join(root, test.task, "api")
+		worktree := filepath.Join(root, test.task+"-worktree")
+		mustMkdirAll(t, dir)
+		mustMkdirAll(t, worktree)
+		writeFile(t, filepath.Join(dir, "status"), "in_progress\n")
+		writeFile(t, filepath.Join(dir, "pane"), "err-pane\n")
+		writeFile(t, filepath.Join(dir, "worktree"), worktree+"\n")
+		setModTime(t, filepath.Join(dir, "status"), now.Add(-test.statusAge))
+		if test.logAge > 0 {
+			writeFile(t, filepath.Join(dir, "worker.log"), "fresh activity\n")
+			setModTime(t, filepath.Join(dir, "worker.log"), now.Add(-test.logAge))
+		}
+	}
+
+	state := dashboard.Collector{
+		FleetRoot:  root,
+		Now:        func() time.Time { return now },
+		StaleAfter: 15 * time.Minute,
+		InspectSupervisor: func(context.Context, string, string) (bool, error) {
+			return false, errors.New("tmux unavailable")
+		},
+	}.Collect(t.Context())
+	byTask := make(map[string]dashboard.Worker, len(state.Workers))
+	for _, worker := range state.Workers {
+		byTask[worker.Task] = worker
+	}
+	for _, test := range tests {
+		if got := byTask[test.task].Health; got != test.wantHealth {
+			t.Errorf("%s health = %q, want %q", test.task, got, test.wantHealth)
+		}
+	}
+}
+
+func TestCollectorClassifiesActiveWithLiveSupervisorAndOrphanedWithoutIt(t *testing.T) {
+	root := t.TempDir()
+	now := time.Date(2026, 7, 26, 12, 0, 0, 0, time.UTC)
+	tests := []struct {
+		task       string
+		status     string
+		pane       string
+		worktree   bool
+		statusAge  time.Duration
+		wantHealth string
+	}{
+		{task: "live-active", status: "in_progress", pane: "live-pane", worktree: true, statusAge: time.Hour, wantHealth: "active"},
+		{task: "live-blocked", status: "blocked", pane: "live-pane", worktree: true, statusAge: time.Hour, wantHealth: "active"},
+		{task: "dead-stale", status: "in_progress", pane: "dead-pane", worktree: true, statusAge: time.Hour, wantHealth: "stale"},
+		{task: "dead-orphaned", status: "in_progress", pane: "dead-pane", worktree: true, statusAge: 5 * time.Minute, wantHealth: "orphaned"},
+		{task: "no-worktree", status: "in_progress", worktree: false, statusAge: time.Minute, wantHealth: "orphaned"},
+		{task: "terminal-done", status: "done", worktree: true, statusAge: time.Minute, wantHealth: "complete"},
+		{task: "explicit-orphaned", status: "orphaned", worktree: false, statusAge: time.Minute, wantHealth: "orphaned"},
+		{task: "explicit-orphaned-live", status: "orphaned", pane: "live-pane", worktree: true, statusAge: time.Minute, wantHealth: "orphaned"},
+	}
+	for _, test := range tests {
+		dir := filepath.Join(root, test.task, "api")
+		mustMkdirAll(t, dir)
+		writeFile(t, filepath.Join(dir, "status"), test.status+"\n")
+		setModTime(t, filepath.Join(dir, "status"), now.Add(-test.statusAge))
+		if test.pane != "" {
+			writeFile(t, filepath.Join(dir, "pane"), test.pane+"\n")
+		}
+		if test.worktree {
+			wt := filepath.Join(root, test.task+"-worktree")
+			mustMkdirAll(t, wt)
+			writeFile(t, filepath.Join(dir, "worktree"), wt+"\n")
+		}
+	}
+
+	inspected := make(map[string]int)
+	collector := dashboard.Collector{
+		FleetRoot:  root,
+		Now:        func() time.Time { return now },
+		StaleAfter: 15 * time.Minute,
+		InspectSupervisor: func(_ context.Context, pane, _ string) (bool, error) {
+			inspected[pane]++
+			return pane == "live-pane", nil
+		},
+	}
+	state := collector.Collect(t.Context())
+	byTask := make(map[string]dashboard.Worker, len(state.Workers))
+	for _, worker := range state.Workers {
+		byTask[worker.Task] = worker
+	}
+	for _, test := range tests {
+		got := byTask[test.task].Health
+		if got != test.wantHealth {
+			t.Errorf("%s health = %q, want %q", test.task, got, test.wantHealth)
+		}
+	}
+	if inspected["live-pane"] == 0 {
+		t.Error("supervisor inspector was not called for pane-bearing workers")
 	}
 }
 
