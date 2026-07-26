@@ -6,11 +6,29 @@ import (
 	"encoding/json"
 	"io/fs"
 	"net/http"
+	"strings"
 	"sync"
 )
 
 type Source interface {
 	Collect(context.Context) State
+}
+
+type DetailSource interface {
+	CollectDetail(context.Context, string, string) (Worker, bool)
+}
+
+type SummarySource interface {
+	CollectSummary(context.Context) State
+}
+
+type summarySource struct{ Source }
+
+func (source summarySource) Collect(ctx context.Context) State {
+	if summaries, ok := source.Source.(SummarySource); ok {
+		return summaries.CollectSummary(ctx)
+	}
+	return source.Source.Collect(ctx)
 }
 
 type collectionCall struct {
@@ -31,7 +49,7 @@ type coalescingSource struct {
 var webAssets embed.FS
 
 func NewHandler(source Source) http.Handler {
-	sharedSource := &coalescingSource{source: source}
+	sharedSource := &coalescingSource{source: summarySource{Source: source}}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", getOnly(func(writer http.ResponseWriter, _ *http.Request) {
 		writeJSON(writer, map[string]string{"status": "ok"})
@@ -46,6 +64,38 @@ func NewHandler(source Source) http.Handler {
 			return
 		}
 		writeJSON(writer, projectState(state))
+	}))
+	mux.HandleFunc("/sergeant/api/diagnostics", getOnly(func(writer http.ResponseWriter, request *http.Request) {
+		writer.Header().Set("Cache-Control", "no-store")
+		ctx, cancel := context.WithTimeout(request.Context(), maxEnrichmentTime)
+		defer cancel()
+		state, ok := sharedSource.Collect(ctx)
+		if !ok || ctx.Err() != nil {
+			writeJSONStatus(writer, http.StatusServiceUnavailable, map[string]string{"error": "fleet diagnostics temporarily unavailable"})
+			return
+		}
+		writeJSON(writer, projectDiagnostics(state.Warnings))
+	}))
+	mux.HandleFunc("/sergeant/api/workers/", getOnly(func(writer http.ResponseWriter, request *http.Request) {
+		writer.Header().Set("Cache-Control", "no-store")
+		parts := strings.Split(strings.TrimPrefix(request.URL.Path, "/sergeant/api/workers/"), "/")
+		detailSource, supported := source.(DetailSource)
+		if !supported || len(parts) != 2 || !configIdentifier.MatchString(parts[0]) || !configIdentifier.MatchString(parts[1]) {
+			http.NotFound(writer, request)
+			return
+		}
+		ctx, cancel := context.WithTimeout(request.Context(), maxEnrichmentTime)
+		defer cancel()
+		worker, ok := detailSource.CollectDetail(ctx, parts[0], parts[1])
+		if !ok {
+			if ctx.Err() != nil {
+				writeJSONStatus(writer, http.StatusServiceUnavailable, map[string]string{"error": "worker detail temporarily unavailable"})
+				return
+			}
+			http.NotFound(writer, request)
+			return
+		}
+		writeJSON(writer, projectWorker(worker))
 	}))
 	mux.HandleFunc("/", getOnly(func(writer http.ResponseWriter, request *http.Request) {
 		if request.URL.Path == "/" || request.URL.Path == "/sergeant" {

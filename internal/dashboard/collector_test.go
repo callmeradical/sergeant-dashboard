@@ -3,10 +3,12 @@ package dashboard_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -401,6 +403,9 @@ func TestCollectorEnrichesWorkerWithReadOnlyDeliveryMetadata(t *testing.T) {
 	if got.PullRequest.URL != "https://github.com/acme/api/pull/7" || got.PullRequest.Checks[0].Conclusion != "SUCCESS" || got.PullRequest.Checks[1].State != "PENDING" {
 		t.Fatalf("pull request = %#v", got.PullRequest)
 	}
+	if got.PullRequest.Checks[1].Context != "legacy-ci" {
+		t.Fatalf("legacy status context = %q, want legacy-ci", got.PullRequest.Checks[1].Context)
+	}
 	if got.Repository != "acme/api" {
 		t.Fatalf("repository = %q, want configured identity", got.Repository)
 	}
@@ -419,6 +424,300 @@ func TestCollectorEnrichesWorkerWithReadOnlyDeliveryMetadata(t *testing.T) {
 	serialized := mustJSON(t, state)
 	if strings.Contains(serialized, "opaque-secret-id") || strings.Contains(serialized, "unrecognized-secret") {
 		t.Fatal("opaque source data was exposed")
+	}
+}
+
+func TestCollectorBoundsFleetTraversalBeforeReadingWorkerMetadata(t *testing.T) {
+	root := t.TempDir()
+	task := filepath.Join(root, "task")
+	for index := range 1001 {
+		worker := filepath.Join(task, fmt.Sprintf("project-%04d", index))
+		mustMkdirAll(t, worker)
+		status := "done\n"
+		if index == 1000 {
+			status = "not-a-status\n"
+		}
+		writeFile(t, filepath.Join(worker, "status"), status)
+	}
+
+	state := dashboard.Collector{FleetRoot: root}.Collect(t.Context())
+	if len(state.Workers) != 1000 {
+		t.Fatalf("workers = %d, want safety bound 1000", len(state.Workers))
+	}
+	if !slices.Contains(state.Warnings, "fleet collection truncated at safety limit") {
+		t.Fatalf("warnings = %q, want truthful truncation warning", state.Warnings)
+	}
+	for _, warning := range state.Warnings {
+		if strings.Contains(warning, "project-1000") {
+			t.Fatalf("collector read worker metadata beyond safety bound: %q", warning)
+		}
+	}
+}
+
+func TestCollectorResolvesConfiguredProjectAndRepositoryNames(t *testing.T) {
+	root := t.TempDir()
+	configRoot := t.TempDir()
+	task := filepath.Join(root, "task-123")
+	worker := filepath.Join(task, "api")
+	mustMkdirAll(t, worker)
+	writeFile(t, filepath.Join(task, "brief.md"), "Project: operator-suite\nBrief:   Repair production API\n")
+	writeFile(t, filepath.Join(worker, "status"), "done\n")
+	writeFile(t, filepath.Join(configRoot, "operator-suite.yaml"), "name: operator-suite\nrepos:\n  - name: api\n    path: /srv/api\n")
+
+	state := dashboard.Collector{FleetRoot: root, ConfigRoot: configRoot}.Collect(t.Context())
+	if len(state.Workers) != 1 {
+		t.Fatalf("workers = %d, want 1", len(state.Workers))
+	}
+	got := state.Workers[0]
+	if got.Project != "operator-suite" || got.Repository != "api" || got.Title != "Repair production API" {
+		t.Fatalf("configured identity = %#v", got)
+	}
+}
+
+func TestCollectorDoesNotGuessUnregisteredIdentity(t *testing.T) {
+	root := t.TempDir()
+	task := filepath.Join(root, "task-123")
+	worker := filepath.Join(task, "opaque-repo-alias")
+	mustMkdirAll(t, worker)
+	writeFile(t, filepath.Join(task, "brief.md"), "Project: missing-project\nBrief:   Repair production API\n")
+	writeFile(t, filepath.Join(worker, "status"), "done\n")
+
+	state := dashboard.Collector{FleetRoot: root, ConfigRoot: t.TempDir()}.Collect(t.Context())
+	got := state.Workers[0]
+	if got.Project != "unavailable" || got.Repository != "unavailable" {
+		t.Fatalf("unregistered identity = %#v, want unavailable labels", got)
+	}
+}
+
+func TestCollectorRejectsAmbiguousOrIncompleteConfiguredIdentity(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		brief  string
+		config string
+	}{
+		{name: "repository path missing", brief: "Project: operator-suite\nBrief: Repair API\n", config: "name: operator-suite\nrepos:\n  - name: api\n"},
+		{name: "duplicate project metadata", brief: "Project: operator-suite\nProject: another-suite\nBrief: Repair API\n", config: "name: operator-suite\nrepos:\n  - name: api\n    path: /srv/api\n"},
+		{name: "duplicate brief metadata", brief: "Project: operator-suite\nBrief: Repair API\nBrief: Ignore this duplicate\n", config: "name: operator-suite\nrepos:\n  - name: api\n    path: /srv/api\n"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			root := t.TempDir()
+			configRoot := t.TempDir()
+			task := filepath.Join(root, "task-123")
+			worker := filepath.Join(task, "api")
+			mustMkdirAll(t, worker)
+			writeFile(t, filepath.Join(task, "brief.md"), test.brief)
+			writeFile(t, filepath.Join(worker, "status"), "done\n")
+			writeFile(t, filepath.Join(configRoot, "operator-suite.yaml"), test.config)
+
+			got := dashboard.Collector{FleetRoot: root, ConfigRoot: configRoot}.CollectSummary(t.Context()).Workers[0]
+			if got.Project != "unavailable" || got.Repository != "unavailable" {
+				t.Fatalf("configured identity = %#v, want unavailable", got)
+			}
+		})
+	}
+}
+
+func TestCollectorSortsConfiguredRepositoriesDeterministically(t *testing.T) {
+	root := t.TempDir()
+	configRoot := t.TempDir()
+	task := filepath.Join(root, "task-123")
+	mustMkdirAll(t, task)
+	writeFile(t, filepath.Join(task, "brief.md"), "Project: operator-suite\nBrief: Repair services\n")
+	for _, repository := range []string{"worker", "api"} {
+		mustMkdirAll(t, filepath.Join(task, repository))
+		writeFile(t, filepath.Join(task, repository, "status"), "done\n")
+	}
+	writeFile(t, filepath.Join(configRoot, "operator-suite.yaml"), "name: operator-suite\nrepos:\n  - name: worker\n    path: /srv/worker\n  - name: api\n    path: /srv/api\n")
+
+	workers := dashboard.Collector{FleetRoot: root, ConfigRoot: configRoot}.CollectSummary(t.Context()).Workers
+	if got := []string{workers[0].Repository, workers[1].Repository}; !slices.Equal(got, []string{"api", "worker"}) {
+		t.Fatalf("repository order = %v, want [api worker]", got)
+	}
+}
+
+func TestCollectorResolvesSameRepositoryNameAcrossProjectsAndRereadsConfigChanges(t *testing.T) {
+	root := t.TempDir()
+	configRoot := t.TempDir()
+	for _, project := range []string{"alpha-suite", "beta-suite"} {
+		task := filepath.Join(root, project+"-task")
+		worker := filepath.Join(task, "api")
+		mustMkdirAll(t, worker)
+		writeFile(t, filepath.Join(task, "brief.md"), "Project: "+project+"\nBrief: Repair API\n")
+		writeFile(t, filepath.Join(worker, "status"), "done\n")
+		writeFile(t, filepath.Join(configRoot, project+".yaml"), "name: "+project+"\nrepos:\n  - name: api\n    path: /srv/"+project+"/api\n")
+	}
+	collector := dashboard.Collector{FleetRoot: root, ConfigRoot: configRoot}
+	workers := collector.CollectSummary(t.Context()).Workers
+	if got := []string{workers[0].Project + "/" + workers[0].Repository, workers[1].Project + "/" + workers[1].Repository}; !slices.Equal(got, []string{"alpha-suite/api", "beta-suite/api"}) {
+		t.Fatalf("configured identities = %v", got)
+	}
+
+	writeFile(t, filepath.Join(configRoot, "alpha-suite.yaml"), "name: alpha-suite\nrepos:\n  - name: worker\n    path: /srv/alpha-suite/worker\n")
+	workers = collector.CollectSummary(t.Context()).Workers
+	if workers[0].Project != "unavailable" || workers[0].Repository != "unavailable" {
+		t.Fatalf("identity after config change = %#v, want unavailable", workers[0])
+	}
+}
+
+func TestCollectorKeepsSummaryTitlesCompact(t *testing.T) {
+	root := t.TempDir()
+	configRoot := t.TempDir()
+	task := filepath.Join(root, "task-123")
+	worker := filepath.Join(task, "api")
+	mustMkdirAll(t, worker)
+	writeFile(t, filepath.Join(task, "brief.md"), "Project: operator-suite\nBrief: Repair production API. This paragraph contains operational instructions that belong only in detail and must not expand the card summary beyond its concise title boundary.\n")
+	writeFile(t, filepath.Join(worker, "status"), "done\n")
+	writeFile(t, filepath.Join(configRoot, "operator-suite.yaml"), "name: operator-suite\nrepos:\n  - name: api\n    path: /srv/api\n")
+
+	state := dashboard.Collector{FleetRoot: root, ConfigRoot: configRoot}.CollectSummary(t.Context())
+	if got, want := state.Workers[0].Title, "Repair production API"; got != want {
+		t.Fatalf("summary title = %q, want %q", got, want)
+	}
+}
+
+func TestCollectorRejectsDetailPathsOutsideFleetRoot(t *testing.T) {
+	root := t.TempDir()
+	outside := t.TempDir()
+	mustMkdirAll(t, filepath.Join(outside, "repo"))
+	writeFile(t, filepath.Join(outside, "repo", "status"), "done\n")
+
+	collector := dashboard.Collector{FleetRoot: root}
+	if worker, ok := collector.CollectDetail(t.Context(), "..", filepath.Base(outside)); ok {
+		t.Fatalf("outside detail = %#v, want rejected traversal", worker)
+	}
+
+	task := filepath.Join(root, "task")
+	mustMkdirAll(t, task)
+	if err := os.Symlink(filepath.Join(outside, "repo"), filepath.Join(task, "repo")); err != nil {
+		t.Fatal(err)
+	}
+	if worker, ok := collector.CollectDetail(t.Context(), "task", "repo"); ok {
+		t.Fatalf("symlinked detail = %#v, want rejected worker", worker)
+	}
+
+	symlinkRoot := t.TempDir()
+	mustMkdirAll(t, filepath.Join(outside, "task", "repo"))
+	writeFile(t, filepath.Join(outside, "task", "repo", "status"), "done\n")
+	if err := os.Symlink(filepath.Join(outside, "task"), filepath.Join(symlinkRoot, "task")); err != nil {
+		t.Fatal(err)
+	}
+	if worker, ok := (dashboard.Collector{FleetRoot: symlinkRoot}).CollectDetail(t.Context(), "task", "repo"); ok {
+		t.Fatalf("intermediate symlink detail = %#v, want rejected worker", worker)
+	}
+}
+
+func TestCollectorRejectsSymlinkedConfiguredIdentitySources(t *testing.T) {
+	root := t.TempDir()
+	configRoot := t.TempDir()
+	task := filepath.Join(root, "task")
+	worker := filepath.Join(task, "api")
+	mustMkdirAll(t, worker)
+	writeFile(t, filepath.Join(worker, "status"), "done\n")
+	privateBrief := filepath.Join(task, "initial_message")
+	writeFile(t, privateBrief, "Project: operator-suite\nBrief: Private prompt title\n")
+	if err := os.Symlink("initial_message", filepath.Join(task, "brief.md")); err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, filepath.Join(configRoot, "operator-suite.yaml"), "name: operator-suite\nrepos:\n  - name: api\n    path: /srv/api\n")
+
+	got := dashboard.Collector{FleetRoot: root, ConfigRoot: configRoot}.CollectSummary(t.Context()).Workers[0]
+	if got.Project != "unavailable" || got.Repository != "unavailable" {
+		t.Fatalf("symlinked configured identity = %#v, want unavailable", got)
+	}
+}
+
+func TestCollectorDoesNotFollowSymlinkedWorkerMetadata(t *testing.T) {
+	root := t.TempDir()
+	workerDir := filepath.Join(root, "task", "repo")
+	mustMkdirAll(t, workerDir)
+	writeFile(t, filepath.Join(workerDir, "status"), "done\n")
+	writeFile(t, filepath.Join(workerDir, "initial_message"), "password=private-prompt\n")
+	if err := os.Symlink("initial_message", filepath.Join(workerDir, "message")); err != nil {
+		t.Fatal(err)
+	}
+
+	worker, ok := (dashboard.Collector{FleetRoot: root}).CollectDetail(t.Context(), "task", "repo")
+	if !ok {
+		t.Fatal("legitimate worker detail was unavailable")
+	}
+	if worker.Message.Present || strings.Contains(worker.Message.Summary, "private-prompt") {
+		t.Fatalf("symlinked message = %#v, want unread", worker.Message)
+	}
+}
+
+func TestCollectorDoesNotFollowSymlinkedGraphifyDirectory(t *testing.T) {
+	root := t.TempDir()
+	workerDir := filepath.Join(root, "task", "repo")
+	worktree := filepath.Join(root, "worktree")
+	mustMkdirAll(t, workerDir)
+	mustMkdirAll(t, worktree)
+	writeFile(t, filepath.Join(workerDir, "status"), "done\n")
+	writeFile(t, filepath.Join(workerDir, "worktree"), worktree+"\n")
+	privateGraph := filepath.Join(root, "private-graph")
+	mustMkdirAll(t, privateGraph)
+	writeFile(t, filepath.Join(privateGraph, "GRAPH_REPORT.md"), "token=private-graph-secret\n")
+	if err := os.Symlink(privateGraph, filepath.Join(worktree, "graphify-out")); err != nil {
+		t.Fatal(err)
+	}
+
+	worker, ok := (dashboard.Collector{FleetRoot: root, Run: func(context.Context, string, string, ...string) ([]byte, error) {
+		return nil, errors.New("unavailable")
+	}}).CollectDetail(t.Context(), "task", "repo")
+	if !ok {
+		t.Fatal("legitimate worker detail was unavailable")
+	}
+	if worker.Graphify.Status == "available" || strings.Contains(worker.Graphify.Summary, "private-graph-secret") {
+		t.Fatalf("symlinked graphify report = %#v, want unread", worker.Graphify)
+	}
+}
+
+func TestCollectorRejectsSameRootIntermediateSymlink(t *testing.T) {
+	root := t.TempDir()
+	privateTask := filepath.Join(root, "private-task")
+	worker := filepath.Join(privateTask, "repo")
+	mustMkdirAll(t, worker)
+	writeFile(t, filepath.Join(worker, "status"), "done\n")
+	writeFile(t, filepath.Join(worker, "message"), "password=private-prompt\n")
+	if err := os.Symlink("private-task", filepath.Join(root, "public-task")); err != nil {
+		t.Fatal(err)
+	}
+
+	if got, ok := (dashboard.Collector{FleetRoot: root}).CollectDetail(t.Context(), "public-task", "repo"); ok {
+		t.Fatalf("same-root intermediate symlink detail = %#v, want rejected worker", got)
+	}
+}
+
+func TestCollectorReportsUnreadableDetailMetadataTruthfully(t *testing.T) {
+	root := t.TempDir()
+	workerDir := filepath.Join(root, "task", "repo")
+	mustMkdirAll(t, workerDir)
+	writeFile(t, filepath.Join(workerDir, "status"), "done\n")
+	message := filepath.Join(workerDir, "message")
+	writeFile(t, message, "operator note\n")
+	if err := os.Chmod(message, 0); err != nil {
+		t.Fatal(err)
+	}
+
+	worker, ok := (dashboard.Collector{FleetRoot: root}).CollectDetail(t.Context(), "task", "repo")
+	if !ok {
+		t.Fatal("legitimate worker detail was unavailable")
+	}
+	if !worker.Message.Present || worker.Message.Status != "unreadable" {
+		t.Fatalf("unreadable message = %#v, want present unreadable metadata", worker.Message)
+	}
+}
+
+func TestCollectorHonorsCancellationBeforeFleetTraversal(t *testing.T) {
+	root := t.TempDir()
+	worker := filepath.Join(root, "task", "project")
+	mustMkdirAll(t, worker)
+	writeFile(t, filepath.Join(worker, "status"), "done\n")
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+
+	state := dashboard.Collector{FleetRoot: root}.Collect(ctx)
+	if len(state.Workers) != 0 || !slices.Contains(state.Warnings, "fleet collection canceled") {
+		t.Fatalf("canceled collection = %#v, want no workers and cancellation warning", state)
 	}
 }
 
@@ -517,8 +816,8 @@ func TestCollectorPreservesOCInjectMetadataForNonEnrichableWorkers(t *testing.T)
 }
 
 func TestRedactMetadataIsDeterministicAndRemovesSecrets(t *testing.T) {
-	input := `{"Authorization":"Bearer super-secret","detail":"password=hunter2 safe-tail","event":"inject","nested":{"count":2,"prompt":"do not expose"},"token":"ghp_abcdefghijklmnopqrstuvwxyz0123456789"}`
-	want := `{"Authorization":"[REDACTED]","detail":"password=[REDACTED]","event":"inject","nested":{"count":2,"prompt":"[REDACTED]"},"token":"[REDACTED]"}`
+	input := `{"Authorization":"Bearer super-secret","auth":"Basic dXNlcjpwYXNz","detail":"password=hunter2 safe-tail","event":"inject","nested":{"count":2,"prompt":"do not expose"},"token":"ghp_abcdefghijklmnopqrstuvwxyz0123456789"}`
+	want := `{"Authorization":"[REDACTED]","auth":"[REDACTED]","detail":"password=[REDACTED]","event":"inject","nested":{"count":2,"prompt":"[REDACTED]"},"token":"[REDACTED]"}`
 	first := dashboard.RedactText(input)
 	second := dashboard.RedactText(input)
 	if first != want || second != want {
@@ -538,6 +837,7 @@ func TestRedactMetadataHandlesAdversarialOperationalText(t *testing.T) {
 		"GITHUB_TOKEN=github_pat_abcdefghijklmnopqrstuvwxyz0123456789",
 		"Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.payload.signature",
 		"authorization=Basic dXNlcjpwYXNzd29yZA==",
+		`request Authorization: Digest response="digest-secret"`,
 		"inline Basic dXNlcjpwYXNzd29yZA== credential",
 		"-----BEGIN PRIVATE KEY-----",
 		"private-key-material",
@@ -548,7 +848,7 @@ func TestRedactMetadataHandlesAdversarialOperationalText(t *testing.T) {
 		"control:\x00byte",
 	}, "\n")
 	redacted := dashboard.RedactText(input)
-	for _, secret := range []string{"line one", "line two", "operator:password", "opaque-token", "correct horse", "dXNlcjpwYXNzd29yZA", "private-key-material", "github_pat_", "eyJhbGci", "quoted value", "AKIAIOSFODNN7EXAMPLE", "xoxb-", "\x00"} {
+	for _, secret := range []string{"line one", "line two", "operator:password", "opaque-token", "correct horse", "dXNlcjpwYXNzd29yZA", "digest-secret", "private-key-material", "github_pat_", "eyJhbGci", "quoted value", "AKIAIOSFODNN7EXAMPLE", "xoxb-", "\x00"} {
 		if strings.Contains(redacted, secret) {
 			t.Errorf("redacted text retained %q: %q", secret, redacted)
 		}
@@ -684,6 +984,148 @@ func TestCollectorClassifiesStaleOrphanedAndCorruptWorkers(t *testing.T) {
 	}
 	if len(state.Warnings) == 0 {
 		t.Error("corrupt worker produced no warning")
+	}
+}
+
+func TestCollectorClassifiesSummaryHealthFromLiveSupervisorEvidence(t *testing.T) {
+	root := t.TempDir()
+	now := time.Date(2026, 7, 22, 12, 0, 0, 0, time.UTC)
+	tests := []struct {
+		task       string
+		status     string
+		pane       string
+		logAge     time.Duration
+		statusAge  time.Duration
+		worktree   bool
+		wantHealth string
+	}{
+		{task: "exact-live", status: "in_progress", pane: "live", statusAge: time.Hour, worktree: true, wantHealth: "active"},
+		{task: "dead-recent", status: "in_progress", pane: "dead", logAge: time.Minute, statusAge: time.Hour, worktree: true, wantHealth: "active"},
+		{task: "collision-old", status: "in_progress", pane: "collision", logAge: time.Hour, statusAge: time.Hour, worktree: true, wantHealth: "stale"},
+		{task: "waiting-live", status: "blocked", pane: "live", statusAge: time.Hour, worktree: true, wantHealth: "active"},
+		{task: "terminal-live", status: "done", pane: "live", statusAge: time.Hour, worktree: true, wantHealth: "complete"},
+		{task: "unsupported", status: "in_progress", pane: "unsupported", logAge: time.Minute, statusAge: time.Hour, worktree: true, wantHealth: "unknown"},
+		{task: "missing-worktree", status: "in_progress", pane: "dead", logAge: time.Hour, statusAge: time.Hour, wantHealth: "orphaned"},
+	}
+	for _, test := range tests {
+		worker := filepath.Join(root, test.task, "api")
+		mustMkdirAll(t, worker)
+		writeFile(t, filepath.Join(worker, "status"), test.status+"\n")
+		writeFile(t, filepath.Join(worker, "pane"), test.pane+"\n")
+		setModTime(t, filepath.Join(worker, "status"), now.Add(-test.statusAge))
+		if test.logAge > 0 {
+			writeFile(t, filepath.Join(worker, "worker.log"), "privacy-safe activity\n")
+			setModTime(t, filepath.Join(worker, "worker.log"), now.Add(-test.logAge))
+		}
+		if test.worktree {
+			worktree := filepath.Join(root, test.task+"-worktree")
+			mustMkdirAll(t, worktree)
+			writeFile(t, filepath.Join(worker, "worktree"), worktree+"\n")
+		}
+	}
+
+	inspected := make(map[string]int)
+	collector := dashboard.Collector{
+		FleetRoot:  root,
+		Now:        func() time.Time { return now },
+		StaleAfter: 15 * time.Minute,
+		InspectSupervisor: func(_ context.Context, pane, stateDir string) (bool, error) {
+			inspected[filepath.Base(filepath.Dir(stateDir))]++
+			switch pane {
+			case "live":
+				return true, nil
+			case "unsupported":
+				return false, errors.New("process inspection unavailable")
+			default:
+				return false, nil
+			}
+		},
+	}
+	state := collector.CollectSummary(t.Context())
+	byTask := make(map[string]dashboard.Worker, len(state.Workers))
+	for _, worker := range state.Workers {
+		byTask[worker.Task] = worker
+	}
+	for _, test := range tests {
+		if got := byTask[test.task].Health; got != test.wantHealth {
+			t.Errorf("%s health = %q, want %q", test.task, got, test.wantHealth)
+		}
+	}
+	if inspected["terminal-live"] != 0 {
+		t.Fatal("terminal worker should not require live process inspection")
+	}
+}
+
+func TestCollectorDetailUsesSameLiveHealthAsSummary(t *testing.T) {
+	root := t.TempDir()
+	now := time.Date(2026, 7, 22, 12, 0, 0, 0, time.UTC)
+	workerDir := filepath.Join(root, "task", "api")
+	worktree := filepath.Join(root, "worktree")
+	mustMkdirAll(t, workerDir)
+	mustMkdirAll(t, worktree)
+	writeFile(t, filepath.Join(workerDir, "status"), "in_progress\n")
+	writeFile(t, filepath.Join(workerDir, "worktree"), worktree+"\n")
+	writeFile(t, filepath.Join(workerDir, "pane"), "live\n")
+	setModTime(t, filepath.Join(workerDir, "status"), now.Add(-time.Hour))
+	collector := dashboard.Collector{
+		FleetRoot:         root,
+		Now:               func() time.Time { return now },
+		StaleAfter:        15 * time.Minute,
+		InspectSupervisor: func(context.Context, string, string) (bool, error) { return true, nil },
+	}
+
+	summary := collector.CollectSummary(t.Context()).Workers[0]
+	detail, ok := collector.CollectDetail(t.Context(), "task", "api")
+	if !ok || detail.Health != summary.Health || detail.Health != "active" {
+		t.Fatalf("summary/detail health = %q/%q ok=%t, want active/active", summary.Health, detail.Health, ok)
+	}
+}
+
+func TestCollectorMatchesSupervisorCommandToExactFleetState(t *testing.T) {
+	stateDir := "/tmp/fleet/task/repository"
+	for _, test := range []struct {
+		name    string
+		command string
+		want    bool
+	}{
+		{name: "exact", command: "/opt/sergeant/bin/sgt-worker /tmp/fleet/task/repository /tmp/worktree opencode message", want: true},
+		{name: "quoted exact", command: `'/opt/sergeant/bin/sgt-worker' '/tmp/fleet/task/repository' /tmp/worktree`, want: true},
+		{name: "colliding state", command: "/opt/sergeant/bin/sgt-worker /tmp/fleet/task/repository-old /tmp/worktree"},
+		{name: "colliding process", command: "/opt/sergeant/bin/sgt-worker-old /tmp/fleet/task/repository /tmp/worktree"},
+		{name: "unrelated command arguments", command: "echo /opt/sergeant/bin/sgt-worker /tmp/fleet/task/repository"},
+		{name: "dead", command: "1|/opt/sergeant/bin/sgt-worker /tmp/fleet/task/repository /tmp/worktree"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			output := test.command
+			if !strings.Contains(output, "|") {
+				output = "0|" + output
+			}
+			live, err := dashboard.ParseSupervisorEvidence(output, stateDir)
+			if err != nil || live != test.want {
+				t.Fatalf("supervisor evidence = %t, %v; want %t", live, err, test.want)
+			}
+		})
+	}
+}
+
+func TestCollectorReportsSummaryProbeFailures(t *testing.T) {
+	root := t.TempDir()
+	worker := filepath.Join(root, "task", "api")
+	worktree := filepath.Join(root, "worktree")
+	mustMkdirAll(t, worker)
+	mustMkdirAll(t, worktree)
+	writeFile(t, filepath.Join(worker, "status"), "in_progress\n")
+	writeFile(t, filepath.Join(worker, "worktree"), worktree+"\n")
+	writeFile(t, filepath.Join(worker, "pane"), "pane\n")
+	state := dashboard.Collector{
+		FleetRoot: root,
+		Run: func(context.Context, string, string, ...string) ([]byte, error) {
+			return nil, errors.New("probe unavailable")
+		},
+		InspectSupervisor: func(context.Context, string, string) (bool, error) { return true, nil },
+	}.CollectSummary(t.Context())
+	if !slices.Contains(state.Warnings, "worker task/api summary probe failed") {
+		t.Fatalf("warnings = %q, want summary probe failure", state.Warnings)
 	}
 }
 
