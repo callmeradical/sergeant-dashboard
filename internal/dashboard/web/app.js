@@ -1,18 +1,17 @@
 const workersNode = document.querySelector('#workers');
-const scrim = document.querySelector('#scrim');
+const searchNode = document.querySelector('#search');
 const drawer = document.querySelector('#drawer');
-const drawerClose = document.querySelector('#drawer-close');
-const drawerBody = document.querySelector('#drawer-body');
-const drawerProject = document.querySelector('#drawer-project');
-const drawerBadge = document.querySelector('#drawer-badge');
-const mainEl = document.querySelector('main');
-
+const drawerContent = document.querySelector('#drawer-content');
+const backdrop = document.querySelector('#drawer-backdrop');
+const closeButton = document.querySelector('#drawer-close');
+const drawerTitle = document.querySelector('#drawer-title');
+const drawerIdentity = document.querySelector('#drawer-identity');
+const pageRegions = document.querySelectorAll('body > header, body > main, body > footer');
 let state = { workers: [], warnings: [] };
 let filter = 'all';
+let query = '';
 let activeCard = null;
-
-const HEALTH_COLORS = { active:'var(--acid)', stale:'var(--amber)', orphaned:'var(--red)', complete:'var(--muted)', attention:'var(--red)', recycled:'var(--muted)' };
-const ATTENTION_HEALTH = new Set(['stale', 'orphaned', 'attention']);
+let detailController = null;
 
 const text = (tag, value, className) => {
   const node = document.createElement(tag);
@@ -21,272 +20,283 @@ const text = (tag, value, className) => {
   return node;
 };
 
-// ── Drawer ───────────────────────────────────────────────────────────────────
+const isAttention = worker => ['stale', 'orphaned', 'unknown', 'attention'].includes(worker.health) || ['blocked', 'needs_input', 'failed'].some(status => (worker.status || '').startsWith(status));
 
-function openDrawer(worker, cardEl) {
-  const statusColor = HEALTH_COLORS[worker.health] || 'var(--muted)';
-
-  drawerProject.textContent = worker.project || '-';
-  drawerBadge.textContent = worker.health || '-';
-  drawerBadge.style.setProperty('--status', statusColor);
-  drawerBadge.style.borderColor = statusColor;
-  drawerBadge.style.color = statusColor;
-
-  drawerBody.replaceChildren();
-  buildDetail(drawerBody, worker);
-
-  if (activeCard) activeCard.classList.remove('drawer-open');
-  activeCard = cardEl;
-  if (activeCard) activeCard.classList.add('drawer-open');
-
-  drawer.classList.add('open');
-  scrim.classList.add('open');
-  if (mainEl) mainEl.inert = true;
-  drawer.focus();
+function signal(worker) {
+  const status = worker.status || '';
+  if (status.startsWith('failed')) return ['failed', 'Failure requires review'];
+  if (status.startsWith('blocked')) return ['blocked', 'Blocked'];
+  if (status.startsWith('needs_input')) return ['needs-input', 'Input required'];
+  if (worker.health === 'orphaned') return ['orphaned', 'Worker orphaned'];
+  if (worker.health === 'attention') return ['stale', 'Attention required'];
+  if (worker.health === 'stale') return ['stale', 'Telemetry stale'];
+  if (worker.health === 'unknown') return ['stale', 'State unknown'];
+  if (worker.health === 'recycled') return ['done', ''];
+  if (worker.health === 'active') return ['active', ''];
+  return ['done', ''];
 }
 
-function closeDrawer() {
-  const trigger = activeCard;
-  drawer.classList.remove('open');
-  scrim.classList.remove('open');
-  if (mainEl) mainEl.inert = false;
-  if (activeCard) { activeCard.classList.remove('drawer-open'); activeCard = null; }
-  // Restore focus to the card that opened the drawer.
-  if (trigger) trigger.focus();
+function searchable(worker) {
+  return [worker.project, worker.repository, worker.task, worker.title, worker.status, worker.health, worker.agent, worker.tdTask, worker.pullRequestState, isAttention(worker) ? 'attention' : ''].join(' ').toLowerCase();
 }
 
-// Focus trap: when the drawer is open, keep Tab cycling within it.
-drawer.addEventListener('keydown', e => {
-  if (!drawer.classList.contains('open') || e.key !== 'Tab') return;
-  const focusable = [...drawer.querySelectorAll('a[href], button, [tabindex="0"]')];
-  if (!focusable.length) return;
-  const first = focusable[0];
-  const last = focusable[focusable.length - 1];
-  if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last.focus(); }
-  else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus(); }
-});
-
-drawerClose.addEventListener('click', closeDrawer);
-scrim.addEventListener('click', closeDrawer);
-document.addEventListener('keydown', e => { if (e.key === 'Escape') closeDrawer(); });
-
-// ── Render ───────────────────────────────────────────────────────────────────
-
-// isAttention returns true for actionable workers: legacy attention states,
-// orphaned records, and active workers in a waiting/blocked lifecycle state.
-const isAttention = w => ATTENTION_HEALTH.has(w.health) || (w.health === 'active' && (w.status === 'needs_input' || w.status === 'blocked'));
+function age(value) {
+  if (!value || value.startsWith('0001-')) return '-';
+  const seconds = Math.max(0, Math.floor((Date.now() - new Date(value).getTime()) / 1000));
+  if (seconds < 60) return `${seconds}s`;
+  if (seconds < 3600) return `${Math.floor(seconds / 60)}m`;
+  if (seconds < 86400) return `${Math.floor(seconds / 3600)}h`;
+  return `${Math.floor(seconds / 86400)}d`;
+}
 
 function render() {
   const attention = state.workers.filter(isAttention);
   document.querySelector('#total').textContent = state.workers.length;
-  document.querySelector('#active').textContent = state.workers.filter(w => w.health === 'active').length;
+  document.querySelector('#active').textContent = state.workers.filter(worker => worker.health === 'active').length;
   document.querySelector('#attention').textContent = attention.length;
-  document.querySelector('#updated').textContent = `Updated ${new Date(state.collectedAt).toLocaleString()}`;
+  document.querySelector('#updated').textContent = state.collectedAt ? `Updated ${new Date(state.collectedAt).toLocaleString()}` : 'Update unavailable';
   const warnings = document.querySelector('#warnings');
   warnings.hidden = !state.warnings.length;
-  warnings.textContent = state.warnings.join('\n');
+  warnings.replaceChildren();
+  warnings.classList.toggle('severity-error', state.highestSeverity === 'error');
+  if (state.warnings.length) {
+    const labels = state.warnings.slice(0, 2).map(group => group.label);
+    if (state.warnings.length > 2) labels.push(`+${state.warnings.length - 2} more categories`);
+    const summary = document.createElement('span');
+    summary.className = 'warning-summary';
+    summary.append(text('strong', state.highestSeverity || 'warning', 'severity-label'), document.createTextNode(` · ${labels.join(' · ')}`));
+    warnings.append(summary);
+    const details = text('button', 'View details');
+    details.type = 'button';
+    details.setAttribute('aria-controls', 'drawer');
+    details.setAttribute('aria-expanded', 'false');
+    details.addEventListener('click', () => openDiagnostics(details));
+    warnings.append(details);
+  }
+
+  const tokens = query.toLowerCase().trim().split(/\s+/).filter(Boolean);
+  const shown = state.workers.filter(worker => {
+    const filterMatch = filter === 'all' || (filter === 'attention' ? isAttention(worker) : worker.health === filter);
+    const haystack = searchable(worker);
+    return filterMatch && tokens.every(token => haystack.includes(token));
+  });
   workersNode.replaceChildren();
-  const shown = state.workers.filter(w =>
-    filter === 'all' ||
-    (filter === 'attention' ? isAttention(w) : w.health === filter)
-  );
-  if (!shown.length) workersNode.append(text('p', 'No workers match this view.', 'empty'));
-  shown.forEach(w => workersNode.append(workerCard(w)));
+  if (!shown.length) workersNode.append(text('p', query ? 'No worker summaries match this search.' : 'No workers match this view.', 'empty'));
+  shown.forEach(worker => workersNode.append(workerCard(worker)));
 }
 
 function workerCard(worker) {
   const card = document.createElement('article');
   card.className = 'worker';
-  card.style.setProperty('--status', HEALTH_COLORS[worker.health] || 'var(--muted)');
+  card.tabIndex = 0;
   card.setAttribute('role', 'button');
-  card.setAttribute('tabindex', '0');
-  const label = [worker.project, worker.health, worker.status, worker.task].filter(Boolean).join(', ');
-  card.setAttribute('aria-label', `Open details: ${label}`);
-
+  card.setAttribute('aria-controls', 'drawer');
+  card.setAttribute('aria-expanded', 'false');
+  const [signalName, attention] = signal(worker);
+  const metadata = [['Agent', worker.agent], ['Updated', age(worker.updatedAt)], ['PR', worker.pullRequestState]];
+  const metadataLabel = metadata.map(([label, value]) => `${label} ${value || 'unavailable'}`).join(', ');
+  card.setAttribute('aria-label', `Open ${worker.project} ${worker.repository} ${worker.task} ${worker.title || ''}, ${worker.status || worker.health}, ${metadataLabel}${attention ? `, ${attention}` : ''}`);
+  card.style.setProperty('--signal', `var(--${signalName})`);
   const head = document.createElement('div');
   head.className = 'worker-head';
-  head.append(text('h3', worker.project), text('span', worker.health, 'badge'));
+  const title = document.createElement('div');
+  title.append(text('p', `${worker.project} / ${worker.repository}`, 'worker-path'), text('h3', worker.title || worker.task), text('div', worker.task, 'task'));
+  head.append(title, text('span', worker.status || worker.health, 'badge'));
   card.append(head);
-
-  if (worker.task) {
-    const sub = document.createElement('div');
-    sub.className = 'worker-sub';
-    sub.title = worker.task;
-    sub.textContent = worker.task;
-    card.append(sub);
-  }
-
-  const line = document.createElement('div');
-  line.className = 'worker-line';
-  const branch = worker.branch ? worker.branch.replace(/^refs\/heads\//, '') : null;
-  const parts = [
-    worker.status ? `<strong>${worker.status}</strong>` : null,
-    branch ? `<strong>${branch.length > 28 ? branch.slice(0, 28) + '\u2026' : branch}</strong>` : null
-  ].filter(Boolean);
-  line.innerHTML = parts.join(' <span style="color:var(--muted)">\u00b7</span> ');
-  card.append(line);
-
-  const activeSignals = [
-    ['message', worker.message?.present],
-    ['graphify', worker.graphify?.present],
-    ['no-mistakes', worker.noMistakes?.available],
-    ['oc-inject', worker.ocInject?.responsePending || worker.ocInject?.responseAcked],
-  ].filter(([, on]) => on).map(([label]) => label);
-
-  if (activeSignals.length) {
-    const signals = document.createElement('div');
-    signals.className = 'signals';
-    activeSignals.forEach(label => signals.append(text('span', label, 'signal')));
-    card.append(signals);
-  }
-
-  const openThis = () => openDrawer(worker, card);
-  card.addEventListener('click', openThis);
-  card.addEventListener('keydown', e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); openThis(); } });
-
-  // DOM-only metadata for text search: hidden from assistive tech, visible to textContent queries
-  const accessible = document.createElement('span');
-  accessible.className = 'sr-only';
-  accessible.setAttribute('aria-hidden', 'true');
-  const metaParts = [
-    worker.tdTask,
-    worker.worktree,
-    worker.message?.summary,
-    worker.diagnostic?.summary,
-    worker.log?.summary,
-    worker.handoff?.summary,
-    worker.pullRequest?.status,
-    ...(worker.pullRequest?.checks || []).map(c => `${c.name || 'check'}: ${c.conclusion || c.state || c.status || 'pending'}`),
-    worker.noMistakes?.summary || worker.noMistakes?.status,
-    worker.graphify?.summary || worker.graphify?.status,
-    worker.ocInject?.responsePending ? 'response pending' : null,
-    worker.ocInject?.responseAcked ? 'response acked' : null,
-  ].filter(Boolean);
-  if (metaParts.length) accessible.textContent = metaParts.join(' ');
-  for (const url of [worker.pullRequest?.url, ...(worker.pullRequest?.comments || []).map(c => c.url)].filter(Boolean)) {
-    const a = document.createElement('a');
-    a.href = url; a.rel = 'noreferrer'; a.tabIndex = -1; a.setAttribute('aria-hidden', 'true');
-    accessible.append(a);
-  }
-  card.append(accessible);
-
+  const meta = document.createElement('dl');
+  meta.className = 'summary-meta';
+  metadata.forEach(([label, value]) => meta.append(text('dt', label), text('dd', value)));
+  card.append(meta);
+  if (attention) card.append(text('p', attention, 'attention-note'));
+  const open = () => openDetail(worker, card);
+  card.addEventListener('click', open);
+  card.addEventListener('keydown', event => {
+    if (event.key === 'Enter' || event.key === ' ') {
+      event.preventDefault();
+      open();
+    }
+  });
   return card;
 }
 
-function buildDetail(container, worker) {
-  // ── Meta grid ──────────────────────────────────────────────────────────────
-  const meta = document.createElement('dl');
-  meta.className = 'meta';
-  const row = (label, value) => {
-    if (!value && value !== 0) return;
-    meta.append(text('dt', label), text('dd', value));
-  };
-  row('Repo', worker.repository);
-  row('Agent', worker.agent);
-  row('Worktree', worker.worktree);
-  if (worker.pullRequest?.url) {
-    const dd = document.createElement('dd');
-    const a = document.createElement('a');
-    a.href = worker.pullRequest.url; a.rel = 'noreferrer';
-    a.textContent = worker.pullRequest.state || 'View PR';
-    dd.append(a);
-    if (worker.pullRequest?.status) {
-      dd.append(document.createTextNode(' (' + worker.pullRequest.status + ')'));
-    }
-    meta.append(text('dt', 'PR'), dd);
-  } else if (worker.pullRequest?.status) {
-    row('PR', worker.pullRequest.status);
-  }
-  if (worker.pullRequest?.checks?.length) {
-    row('Checks', worker.pullRequest.checks.map(c => `${c.name || 'check'}: ${c.conclusion || c.state || c.status || 'pending'}`).join(', '));
-  }
-  if (worker.pullRequest?.comments?.length) {
-    worker.pullRequest.comments.forEach(c => {
-      const label = `${c.author || ''}: ${c.body || ''}`.trim() || 'View comment';
-      if (c.url) {
-        const dd = document.createElement('dd');
-        const a = document.createElement('a');
-        a.href = c.url; a.rel = 'noreferrer'; a.textContent = label;
-        dd.append(a); meta.append(text('dt', 'Comment'), dd);
-      } else {
-        row('Comment', label);
-      }
-    });
-  }
-  [['Message', worker.message], ['Diag', worker.diagnostic], ['Log', worker.log], ['Handoff', worker.handoff]].forEach(([label, file]) => {
-    if (file?.present) row(label, file.summary || 'present');
+function addRow(list, label, value) {
+  if (value === undefined || value === null || value === '') return;
+  list.append(text('dt', label), text('dd', value));
+}
+
+function detailSection(title, className = '') {
+  const section = document.createElement('section');
+  section.className = `detail-section ${className}`.trim();
+  section.append(text('h3', title));
+  const rows = document.createElement('dl');
+  rows.className = 'detail-meta';
+  section.append(rows);
+  return [section, rows];
+}
+
+function detailView(worker) {
+  const fragment = document.createDocumentFragment();
+  const [overview, overviewRows] = detailSection('Overview');
+  [['Task', worker.task], ['Status', worker.status], ['Health', worker.health], ['Agent', worker.agent], ['td', worker.tdTask], ['Description / acceptance / reviews', worker.td?.summary]].forEach(([label, value]) => addRow(overviewRows, label, value));
+  fragment.append(overview);
+
+  const [attention, attentionRows] = detailSection('Attention', 'attention-callout');
+  addRow(attentionRows, 'Current signal', signal(worker)[1] || 'No immediate attention required');
+  if (worker.message?.present || worker.message?.status) addRow(attentionRows, 'Message', worker.message.summary || worker.message.status || 'present');
+  if (worker.diagnostic?.present || worker.diagnostic?.status) addRow(attentionRows, 'Diagnostic', worker.diagnostic.summary || worker.diagnostic.status || 'present');
+  fragment.append(attention);
+
+  const [timeline, timelineRows] = detailSection('Timeline', 'timeline');
+  [['Log', worker.log], ['Handoff', worker.handoff]].forEach(([label, file]) => {
+    if (file?.present || file?.status) addRow(timelineRows, label, file.summary || file.status || 'present');
   });
-  if (worker.noMistakes?.available || worker.noMistakes?.status) {
-    row('no-mistakes', worker.noMistakes?.summary || worker.noMistakes?.status || (worker.noMistakes?.phase ? `${worker.noMistakes.phase} phase` : 'detected'));
+  if (worker.pullRequest?.comments?.length) addRow(timelineRows, 'Comments', worker.pullRequest.comments.map(comment => `${comment.author || 'comment'}: ${comment.body || '-'}`).join('\n'));
+  fragment.append(timeline);
+
+  const [delivery, deliveryRows] = detailSection('Delivery');
+  if (worker.pullRequest?.url) {
+    const value = document.createElement('dd');
+    const link = document.createElement('a');
+    link.href = worker.pullRequest.url;
+    link.rel = 'noreferrer';
+    link.textContent = worker.pullRequest.state || 'View pull request';
+    value.append(link);
+    deliveryRows.append(text('dt', 'Pull request'), value);
   }
-  if (worker.graphify?.present || worker.graphify?.status) {
-    row('Graphify', worker.graphify?.summary || worker.graphify?.status || 'available');
-  }
-  if (worker.ocInject?.responsePending) {
-    const at = worker.ocInject.responsePendingAt ? ` since ${new Date(worker.ocInject.responsePendingAt).toLocaleString()}` : '';
-    row('oc-inject', `response pending${at}`);
-  } else if (worker.ocInject?.responseAcked) {
-    const at = worker.ocInject.responseAckedAt ? ` ${new Date(worker.ocInject.responseAckedAt).toLocaleString()}` : '';
-    row('oc-inject', `acked${at}`);
-  }
-  container.append(meta);
+  addRow(deliveryRows, 'PR source', worker.pullRequest?.status);
+  if (worker.pullRequest?.checks?.length) addRow(deliveryRows, 'Checks', worker.pullRequest.checks.map(check => `${check.name || check.context || 'check'}${check.context && check.name ? ` (${check.context})` : ''}: ${check.conclusion || check.state || check.status || 'pending'}`).join(', '));
+  if (worker.noMistakes?.available || worker.noMistakes?.status) addRow(deliveryRows, 'no-mistakes', worker.noMistakes.summary || worker.noMistakes.status || worker.noMistakes.phase);
+  if (worker.graphify?.present || worker.graphify?.status) addRow(deliveryRows, 'Graphify', worker.graphify.summary || worker.graphify.status || 'present');
+  if (worker.ocInject?.responsePending) addRow(deliveryRows, 'oc-inject', 'response pending');
+  if (worker.ocInject?.responseAcked) addRow(deliveryRows, 'oc-inject', 'response acknowledged');
+  fragment.append(delivery);
 
-  // ── Message block ──────────────────────────────────────────────────────────
-  if (worker.message?.present && worker.message?.summary) {
-    const msg = document.createElement('div');
-    msg.className = 'message';
-    msg.textContent = worker.message.summary;
-    container.append(msg);
-  }
+  const [files, fileRows] = detailSection('Files');
+  [['Branch', worker.branch], ['Worktree', worker.worktree]].forEach(([label, value]) => {
+    if (!value) return;
+    const block = text('code', value, 'path-block');
+    fileRows.append(text('dt', label));
+    const cell = document.createElement('dd');
+    cell.append(block);
+    fileRows.append(cell);
+  });
+  [['Message', worker.message], ['Diagnostic', worker.diagnostic], ['Worker log', worker.log], ['Handoff', worker.handoff]].forEach(([label, file]) => {
+    addRow(fileRows, label, file?.status || (file?.present ? 'available' : 'missing'));
+  });
+  fragment.append(files);
+  return fragment;
+}
 
-  // ── Tech Debt section ──────────────────────────────────────────────────────
-  const hasTD = worker.tdTask || worker.td?.present;
-  if (hasTD) {
-    const section = document.createElement('div');
-    section.className = 'td-section';
+function diagnosticsView(diagnostics) {
+  const fragment = document.createDocumentFragment();
+  diagnostics.warnings.forEach(group => {
+    const section = document.createElement('section');
+    section.className = `detail-section diagnostic-group severity-${group.severity}`;
+    const title = group.label.replace(/^\d+\s+/, '');
+    section.append(text('h3', `${group.severity}: ${title.charAt(0).toUpperCase() + title.slice(1)}`));
+    const list = document.createElement('ul');
+    (group.items || []).forEach(item => list.append(text('li', item)));
+    if (group.truncated) list.append(text('li', 'Additional diagnostics omitted at the safety limit.'));
+    section.append(list);
+    fragment.append(section);
+  });
+  return fragment;
+}
 
-    const hdr = document.createElement('div');
-    hdr.className = 'td-section-header';
-    hdr.textContent = 'Tech Debt';
-    section.append(hdr);
+function beginInspection(trigger, identity, title) {
+  if (detailController) detailController.abort();
+  activeCard?.setAttribute('aria-expanded', 'false');
+  const controller = new AbortController();
+  detailController = controller;
+  activeCard = trigger;
+  trigger.setAttribute('aria-expanded', 'true');
+  drawerIdentity.textContent = identity;
+  drawerTitle.textContent = title;
+  drawerContent.replaceChildren(text('p', 'Loading operational context...', 'empty'));
+  backdrop.hidden = false;
+  drawer.hidden = false;
+  document.body.classList.add('drawer-open');
+  pageRegions.forEach(region => { region.inert = true; });
+  closeButton.focus();
+  return controller;
+}
 
-    const card = document.createElement('div');
-    card.className = 'td-card';
-
-    if (worker.tdTask) {
-      const chip = document.createElement('code');
-      chip.className = 'td-chip';
-      chip.textContent = worker.tdTask;
-      card.append(chip);
-    }
-
-    if (worker.td?.present && worker.td?.summary) {
-      const desc = document.createElement('p');
-      desc.className = 'td-desc';
-      desc.textContent = worker.td.summary;
-      card.append(desc);
-    }
-
-    if (worker.td?.status && worker.td.status !== 'available') {
-      const pill = document.createElement('span');
-      pill.className = 'td-pill';
-      pill.textContent = worker.td.status;
-      card.append(pill);
-    }
-
-    section.append(card);
-    container.append(section);
+async function openDetail(worker, card) {
+  const controller = beginInspection(card, `${worker.project} / ${worker.repository} / ${worker.task} / ${worker.status || worker.health}`, worker.title || worker.task);
+  try {
+    const response = await fetch(`api/workers/${encodeURIComponent(worker.task)}/${encodeURIComponent(worker.detailKey || worker.repository)}`, { cache: 'no-store', signal: controller.signal });
+    if (!response.ok) throw new Error('detail unavailable');
+    const detail = await response.json();
+    if (controller !== detailController) return;
+    drawerContent.replaceChildren(detailView(detail));
+  } catch (error) {
+    if (controller === detailController && error.name !== 'AbortError') drawerContent.replaceChildren(text('p', 'Worker detail is temporarily unavailable.', 'empty'));
   }
 }
 
-// ── Filters ──────────────────────────────────────────────────────────────────
+async function openDiagnostics(button) {
+  const controller = beginInspection(button, 'FLEET DIAGNOSTICS', 'System diagnostics');
+  try {
+    const response = await fetch('api/diagnostics', { cache: 'no-store', signal: controller.signal });
+    if (!response.ok) throw new Error('diagnostics unavailable');
+    const diagnostics = await response.json();
+    if (controller !== detailController) return;
+    drawerContent.replaceChildren(diagnosticsView(diagnostics));
+  } catch (error) {
+    if (controller === detailController && error.name !== 'AbortError') drawerContent.replaceChildren(text('p', 'Fleet diagnostics are temporarily unavailable.', 'empty'));
+  }
+}
 
-document.querySelectorAll('[data-filter]').forEach(btn => btn.addEventListener('click', () => {
-  filter = btn.dataset.filter;
-  document.querySelectorAll('[data-filter]').forEach(b => b.classList.toggle('selected', b === btn));
-  closeDrawer();
+function closeDetail() {
+  if (drawer.hidden) return;
+  if (detailController) detailController.abort();
+  detailController = null;
+  drawer.hidden = true;
+  backdrop.hidden = true;
+  drawerContent.replaceChildren();
+  document.body.classList.remove('drawer-open');
+  pageRegions.forEach(region => { region.inert = false; });
+  const restore = activeCard;
+  activeCard = null;
+  restore?.setAttribute('aria-expanded', 'false');
+  drawerIdentity.textContent = 'WORKER DETAIL';
+  drawerTitle.textContent = 'Operational context';
+  if (restore?.isConnected) restore.focus();
+}
+
+drawer.addEventListener('keydown', event => {
+  if (event.key === 'Escape') {
+    event.preventDefault();
+    closeDetail();
+    return;
+  }
+  if (event.key !== 'Tab') return;
+  const focusable = [...drawer.querySelectorAll('button, a[href], [tabindex]:not([tabindex="-1"])')];
+  if (!focusable.length) return;
+  const first = focusable[0];
+  const last = focusable.at(-1);
+  if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last.focus(); }
+  if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first.focus(); }
+});
+closeButton.addEventListener('click', closeDetail);
+backdrop.addEventListener('click', closeDetail);
+
+document.querySelectorAll('[data-filter]').forEach(button => button.addEventListener('click', () => {
+  filter = button.dataset.filter;
+  document.querySelectorAll('[data-filter]').forEach(item => {
+    item.classList.toggle('selected', item === button);
+    item.setAttribute('aria-pressed', String(item === button));
+  });
   render();
 }));
+searchNode.addEventListener('input', () => { query = searchNode.value; render(); });
+searchNode.addEventListener('keydown', event => {
+  if (event.key === 'Escape') {
+    searchNode.value = '';
+    query = '';
+    render();
+  }
+});
 
 // ── Data fetch + 5s poll ─────────────────────────────────────────────────────
 

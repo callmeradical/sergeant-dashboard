@@ -180,17 +180,16 @@ exit 0
 	}
 }
 
-func TestDocumentationCoversServeValidationAndRollback(t *testing.T) {
+func TestDocumentationCoversTailnetProxyValidationAndRollback(t *testing.T) {
 	readme, err := os.ReadFile("README.md")
 	if err != nil {
 		t.Fatal(err)
 	}
 	for _, required := range []string{
-		"tailscale serve --bg --set-path /sergeant http://127.0.0.1:8992/sergeant",
-		"https://cleanthes.taila4fb6a.ts.net/sergeant/",
+		"http://cleanthes:8992/",
+		"sergeant-dashboard-tailnet-proxy.service",
 		"./scripts/validate.sh",
 		"## Rollback",
-		"tailscale serve --https=443 --set-path=/sergeant off",
 		"./scripts/uninstall.sh",
 		"If the service cannot be stopped, uninstall exits without removing the unit or binary",
 	} {
@@ -233,42 +232,45 @@ func TestLifecycleScriptsRejectNonLinuxHosts(t *testing.T) {
 	}
 }
 
-func TestValidationRequiresServePathAndBackendAssociation(t *testing.T) {
+func TestValidationRequiresDashboardAndTailnetProxyServicesAndExactRoute(t *testing.T) {
 	home := t.TempDir()
-	binDir := filepath.Join(home, ".local", "bin")
 	mocks := filepath.Join(t.TempDir(), "bin")
-	mustMkdir(t, binDir)
 	mustMkdir(t, mocks)
-	writeExecutable(t, filepath.Join(mocks, "curl"), "#!/bin/sh\nexit 0\n")
-	writeExecutable(t, filepath.Join(mocks, "tailscale"), "#!/bin/sh\nprintf '%s\\n' \"$TAILSCALE_STATUS\"\n")
+	logPath := filepath.Join(t.TempDir(), "validation.log")
+	writeExecutable(t, filepath.Join(mocks, "curl"), "#!/bin/sh\nprintf 'curl %s\\n' \"$*\" >> \"$VALIDATION_LOG\"\nprintf '%s\\n' \"${CURL_BODY:-<title>Sergeant | Fleet command</title>}\"\n")
+	writeExecutable(t, filepath.Join(mocks, "systemctl"), "#!/bin/sh\nprintf 'systemctl %s\\n' \"$*\" >> \"$VALIDATION_LOG\"\n")
+	writeExecutable(t, filepath.Join(mocks, "tailscale"), "#!/bin/sh\nprintf '100.122.151.88\\n'\n")
 
-	build := exec.Command("go", "build", "-o", filepath.Join(binDir, "sergeant-dashboard"), "./cmd/sergeant-dashboard")
-	if output, err := build.CombinedOutput(); err != nil {
-		t.Fatalf("build validator: %v: %s", err, output)
-	}
-	baseEnv := append(os.Environ(), "HOME="+home, "PATH="+mocks+":/usr/bin:/bin")
-	misassociated := `{"Web":{"cleanthes.taila4fb6a.ts.net:443":{"Handlers":{"/sergeant":{"Proxy":"http://127.0.0.1:9999/sergeant"},"/other":{"Proxy":"http://127.0.0.1:8992/sergeant"}}},"other-host:443":{"Handlers":{"/sergeant":{"Proxy":"http://127.0.0.1:8992/sergeant"}}}}}`
 	command := exec.Command("sh", "scripts/validate.sh")
-	command.Env = append(baseEnv, "TAILSCALE_STATUS="+misassociated)
-	if output, err := command.CombinedOutput(); err == nil {
-		t.Fatalf("validation accepted unrelated Serve path/backend values: %s", output)
-	}
-
-	associated := `{"Web":{"cleanthes.taila4fb6a.ts.net:443":{"Handlers":{"/sergeant":{"Proxy":"http://127.0.0.1:8992/sergeant"}}}}}`
-	command = exec.Command("sh", "scripts/validate.sh")
-	command.Env = append(baseEnv, "TAILSCALE_STATUS="+associated)
+	command.Env = append(os.Environ(), "HOME="+home, "PATH="+mocks+":/usr/bin:/bin", "VALIDATION_LOG="+logPath)
 	if output, err := command.CombinedOutput(); err != nil {
-		t.Fatalf("validation rejected associated Serve path/backend: %v: %s", err, output)
+		t.Fatalf("validation rejected proxy contract: %v: %s", err, output)
+	}
+	logData, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, required := range []string{
+		"systemctl --user is-active --quiet sergeant-dashboard.service",
+		"systemctl --user is-active --quiet sergeant-dashboard-tailnet-proxy.service",
+		"curl --fail --silent --show-error http://127.0.0.1:8992/healthz",
+		"curl --fail --silent --show-error http://127.0.0.1:8992/sergeant/",
+		"curl --fail --silent --show-error --location --resolve cleanthes:8992:100.122.151.88 http://cleanthes:8992/",
+	} {
+		if !strings.Contains(string(logData), required) {
+			t.Errorf("validation log lacks %q: %s", required, logData)
+		}
+	}
+	for _, forbidden := range []string{"tailscale serve", "https://cleanthes"} {
+		if strings.Contains(string(logData), forbidden) {
+			t.Errorf("validation retained obsolete route %q: %s", forbidden, logData)
+		}
 	}
 
 	command = exec.Command("sh", "scripts/validate.sh")
-	command.Env = append(baseEnv,
-		"TAILSCALE_STATUS="+associated,
-		"SERGEANT_TAILNET_URL=https://other-host.ts.net/sergeant/",
-		"SERGEANT_TAILNET_HOST=cleanthes.taila4fb6a.ts.net:443",
-	)
+	command.Env = append(os.Environ(), "HOME="+home, "PATH="+mocks+":/usr/bin:/bin", "VALIDATION_LOG="+logPath, "CURL_BODY=Fleet command but unrelated")
 	if output, err := command.CombinedOutput(); err == nil {
-		t.Fatalf("validation accepted independently mismatched URL and host: %s", output)
+		t.Fatalf("validation accepted unrelated tailnet content: %s", output)
 	}
 }
 
@@ -286,23 +288,22 @@ func TestValidationRejectsNonArrayWorkersPayload(t *testing.T) {
 	writeExecutable(t, filepath.Join(mocks, "curl"), `#!/bin/sh
 case "$*" in
   *"http://127.0.0.1:8992/sergeant/api/state"*) printf '%s' "$SERGEANT_STATE" ;;
-  *) exit 0 ;;
+  *) printf '<title>Sergeant | Fleet command</title>\n' ;;
 esac
 `)
 	writeExecutable(t, filepath.Join(mocks, "jq"), "#!/bin/sh\nexec "+jqPath+" \"$@\"\n")
-	writeExecutable(t, filepath.Join(mocks, "tailscale"), "#!/bin/sh\nprintf '%s\\n' \"$TAILSCALE_STATUS\"\n")
+	writeExecutable(t, filepath.Join(mocks, "systemctl"), "#!/bin/sh\nexit 0\n")
+	writeExecutable(t, filepath.Join(mocks, "tailscale"), "#!/bin/sh\nprintf '100.122.151.88\n'\n")
 
 	build := exec.Command("go", "build", "-o", filepath.Join(binDir, "sergeant-dashboard"), "./cmd/sergeant-dashboard")
 	if output, err := build.CombinedOutput(); err != nil {
 		t.Fatalf("build validator: %v: %s", err, output)
 	}
 
-	associated := `{"Web":{"cleanthes.taila4fb6a.ts.net:443":{"Handlers":{"/sergeant":{"Proxy":"http://127.0.0.1:8992/sergeant"}}}}}`
 	command := exec.Command("sh", "scripts/validate.sh")
 	command.Env = append(os.Environ(),
 		"HOME="+home,
 		"PATH="+mocks+":/usr/bin:/bin",
-		"TAILSCALE_STATUS="+associated,
 		"SERGEANT_STATE={\"workers\":{}}",
 	)
 	output, err := command.CombinedOutput()
@@ -329,19 +330,24 @@ case "$*" in
 esac
 `)
 	writeExecutable(t, filepath.Join(mocks, "jq"), "#!/bin/sh\nexec "+jqPath+" \"$@\"\n")
-	writeExecutable(t, filepath.Join(mocks, "tailscale"), "#!/bin/sh\nprintf '%s\\n' \"$TAILSCALE_STATUS\"\n")
+	writeExecutable(t, filepath.Join(mocks, "systemctl"), "#!/bin/sh\nexit 0\n")
+	writeExecutable(t, filepath.Join(mocks, "tailscale"), "#!/bin/sh\nprintf '100.122.151.88\n'\n")
 
 	build := exec.Command("go", "build", "-o", filepath.Join(binDir, "sergeant-dashboard"), "./cmd/sergeant-dashboard")
 	if output, err := build.CombinedOutput(); err != nil {
 		t.Fatalf("build validator: %v: %s", err, output)
 	}
 
-	associated := `{"Web":{"cleanthes.taila4fb6a.ts.net:443":{"Handlers":{"/sergeant":{"Proxy":"http://127.0.0.1:8992/sergeant"}}}}}`
+	writeExecutable(t, filepath.Join(mocks, "curl"), `#!/bin/sh
+case "$*" in
+  *"http://127.0.0.1:8992/sergeant/api/state"*) printf '%s' "$SERGEANT_STATE" ;;
+  *) printf '<title>Sergeant | Fleet command</title>\n' ;;
+esac
+`)
 	command := exec.Command("sh", "scripts/validate.sh")
 	command.Env = append(os.Environ(),
 		"HOME="+home,
 		"PATH="+mocks+":/usr/bin:/bin",
-		"TAILSCALE_STATUS="+associated,
 		"SERGEANT_STATE={\"workers\":[{\"health\":\"active\"},{\"health\":\"orphaned\"}]}",
 	)
 	output, err := command.CombinedOutput()
@@ -362,20 +368,20 @@ func TestValidationReportsSkippedAPICheckWithoutJQ(t *testing.T) {
 	mocks := filepath.Join(t.TempDir(), "bin")
 	mustMkdir(t, binDir)
 	mustMkdir(t, mocks)
-	writeExecutable(t, filepath.Join(mocks, "curl"), "#!/bin/sh\nexit 0\n")
-	writeExecutable(t, filepath.Join(mocks, "tailscale"), "#!/bin/sh\nprintf '%s\\n' \"$TAILSCALE_STATUS\"\n")
+	writeExecutable(t, filepath.Join(mocks, "curl"), "#!/bin/sh\nprintf '<title>Sergeant | Fleet command</title>\\n'\n")
+	writeExecutable(t, filepath.Join(mocks, "grep"), "#!/bin/sh\nexec /usr/bin/grep \"$@\"\n")
+	writeExecutable(t, filepath.Join(mocks, "systemctl"), "#!/bin/sh\nexit 0\n")
+	writeExecutable(t, filepath.Join(mocks, "tailscale"), "#!/bin/sh\nprintf '100.122.151.88\n'\n")
 
 	build := exec.Command("go", "build", "-o", filepath.Join(binDir, "sergeant-dashboard"), "./cmd/sergeant-dashboard")
 	if output, err := build.CombinedOutput(); err != nil {
 		t.Fatalf("build validator: %v: %s", err, output)
 	}
 
-	associated := `{"Web":{"cleanthes.taila4fb6a.ts.net:443":{"Handlers":{"/sergeant":{"Proxy":"http://127.0.0.1:8992/sergeant"}}}}}`
 	command := exec.Command("sh", "scripts/validate.sh")
 	command.Env = append(os.Environ(),
 		"HOME="+home,
 		"PATH="+mocks,
-		"TAILSCALE_STATUS="+associated,
 	)
 	output, err := command.CombinedOutput()
 	if err != nil {

@@ -19,13 +19,43 @@ const (
 )
 
 type projectedState struct {
-	CollectedAt time.Time         `json:"collectedAt"`
-	Workers     []projectedWorker `json:"workers"`
-	Warnings    []string          `json:"warnings"`
+	CollectedAt     time.Time               `json:"collectedAt"`
+	Workers         []projectedSummary      `json:"workers"`
+	Warnings        []projectedWarningGroup `json:"warnings"`
+	HighestSeverity string                  `json:"highestSeverity,omitempty"`
+}
+
+type projectedWarningGroup struct {
+	Category  string   `json:"category"`
+	Count     int      `json:"count"`
+	Label     string   `json:"label"`
+	Severity  string   `json:"severity"`
+	Items     []string `json:"items,omitempty"`
+	Truncated bool     `json:"truncated,omitempty"`
+}
+
+type projectedDiagnostics struct {
+	Warnings        []projectedWarningGroup `json:"warnings"`
+	HighestSeverity string                  `json:"highestSeverity,omitempty"`
+}
+
+type projectedSummary struct {
+	Task             string    `json:"task"`
+	Title            string    `json:"title,omitempty"`
+	Project          string    `json:"project"`
+	Repository       string    `json:"repository"`
+	Status           string    `json:"status"`
+	Health           string    `json:"health"`
+	Agent            string    `json:"agent,omitempty"`
+	TDTask           string    `json:"tdTask,omitempty"`
+	PullRequestState string    `json:"pullRequestState,omitempty"`
+	DetailKey        string    `json:"detailKey"`
+	UpdatedAt        time.Time `json:"updatedAt,omitempty"`
 }
 
 type projectedWorker struct {
 	Task        string               `json:"task"`
+	Title       string               `json:"title,omitempty"`
 	Project     string               `json:"project"`
 	Repository  string               `json:"repository,omitempty"`
 	Status      string               `json:"status"`
@@ -70,6 +100,7 @@ type projectedPullRequest struct {
 
 type projectedCheck struct {
 	Name       string `json:"name,omitempty"`
+	Context    string `json:"context,omitempty"`
 	Status     string `json:"status,omitempty"`
 	Conclusion string `json:"conclusion,omitempty"`
 	State      string `json:"state,omitempty"`
@@ -89,39 +120,37 @@ type projectedAudit struct {
 }
 
 var (
-	tdTaskID        = regexp.MustCompile(`^td-[A-Za-z0-9]+$`)
-	prPath          = regexp.MustCompile(`^/([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)/pull/([0-9]+)/?$`)
-	githubPath      = regexp.MustCompile(`^[A-Za-z0-9_./-]+$`)
-	githubFragment  = regexp.MustCompile(`^(|issuecomment-[0-9]+)$`)
-	repositoryName  = regexp.MustCompile(`^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$`)
-	credentialURL   = regexp.MustCompile(`(?i)([a-z][a-z0-9+.-]*://)[^/@\s]+@`)
-	assignment      = regexp.MustCompile(`(?i)^([ \t]*(?:export[ \t]+)?([A-Za-z_][A-Za-z0-9_.-]*)[ \t]*[:=][ \t]*)(.*)$`)
-	quotedDouble    = regexp.MustCompile(`(?i)((?:api[_-]?key|credential|password|secret|token)\s*[:=]\s*)"[^"]*"`)
-	quotedSingle    = regexp.MustCompile(`(?i)((?:api[_-]?key|credential|password|secret|token)\s*[:=]\s*)'[^']*'`)
-	basicCredential = regexp.MustCompile(`(?i)(basic\s+)[A-Za-z0-9+/=]+`)
-	privateKeyStart = regexp.MustCompile(`^-----BEGIN (?:[A-Z0-9 ]+ )?PRIVATE KEY-----$`)
-	privateKeyEnd   = regexp.MustCompile(`^-----END (?:[A-Z0-9 ]+ )?PRIVATE KEY-----$`)
-	secretValue     = regexp.MustCompile(`(?i)(bearer\s+)[^\s,;]+|((?:api[_-]?key|credential|password|secret|token)\s*[:=]\s*)[^\s,;]+|AKIA[A-Z0-9]{16}|gh[pousr]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,}|npm_[A-Za-z0-9]{20,}|sk-[A-Za-z0-9_-]{20,}|xox[baprs]-[A-Za-z0-9-]{20,}`)
+	tdTaskID         = regexp.MustCompile(`^td-[A-Za-z0-9]+$`)
+	configIdentifier = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.-]*$`)
+	prPath           = regexp.MustCompile(`^/([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)/pull/([0-9]+)/?$`)
+	githubPath       = regexp.MustCompile(`^[A-Za-z0-9_./-]+$`)
+	githubFragment   = regexp.MustCompile(`^(|issuecomment-[0-9]+)$`)
+	repositoryName   = regexp.MustCompile(`^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$`)
+	credentialURL    = regexp.MustCompile(`(?i)([a-z][a-z0-9+.-]*://)[^/@\s]+@`)
+	authorization    = regexp.MustCompile(`(?i)(authorization\s*[:=]\s*)[^\r\n]+`)
+	assignment       = regexp.MustCompile(`(?i)^([ \t]*(?:export[ \t]+)?([A-Za-z_][A-Za-z0-9_.-]*)[ \t]*[:=][ \t]*)(.*)$`)
+	quotedDouble     = regexp.MustCompile(`(?i)((?:api[_-]?key|credential|password|secret|token)\s*[:=]\s*)"[^"]*"`)
+	quotedSingle     = regexp.MustCompile(`(?i)((?:api[_-]?key|credential|password|secret|token)\s*[:=]\s*)'[^']*'`)
+	basicCredential  = regexp.MustCompile(`(?i)(basic\s+)[A-Za-z0-9+/=]+`)
+	privateKeyStart  = regexp.MustCompile(`^-----BEGIN (?:[A-Z0-9 ]+ )?PRIVATE KEY-----$`)
+	privateKeyEnd    = regexp.MustCompile(`^-----END (?:[A-Z0-9 ]+ )?PRIVATE KEY-----$`)
+	secretValue      = regexp.MustCompile(`(?i)(bearer\s+)[^\s,;]+|((?:api[_-]?key|credential|password|secret|token)\s*[:=]\s*)[^\s,;]+|AKIA[A-Z0-9]{16}|gh[pousr]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,}|npm_[A-Za-z0-9]{20,}|sk-[A-Za-z0-9_-]{20,}|xox[baprs]-[A-Za-z0-9-]{20,}`)
 )
 
 // isOperational reports whether a worker is part of the operational set:
-// exact-supervisor-verified live workers (active) and actionable non-terminal
+// supervisor-verified live workers (active) and actionable non-terminal
 // records (orphaned). Completed, stale historical, and unknown malformed
-// inventory are excluded from the overview and board.
+// inventory are excluded from the overview and summarized in warnings.
 func isOperational(health string) bool {
 	return health == "active" || health == "orphaned"
 }
 
 func projectState(state State) projectedState {
-	warningCount := min(len(state.Warnings), maxProjectedWarnings)
-	projected := projectedState{CollectedAt: state.CollectedAt, Workers: []projectedWorker{}, Warnings: make([]string, 0)}
-
-	// Pass 1: scan all workers, count excluded health classes for diagnostics,
-	// then collect operational workers up to the safety limit. Filtering happens
-	// before truncation so active workers are never dropped behind a wall of
-	// stale/complete/unknown inventory.
+	// Phase 1: filter to the operational set and count excluded classes.
+	// Filtering happens before truncation so active workers are never dropped
+	// behind a wall of stale/complete/unknown inventory.
 	var completeCount, staleCount, unknownCount int
-	truncatedWorkers := false
+	var operationalWorkers []Worker
 	for i := range state.Workers {
 		switch state.Workers[i].Health {
 		case "complete":
@@ -132,37 +161,118 @@ func projectState(state State) projectedState {
 			unknownCount++
 		default:
 			if isOperational(state.Workers[i].Health) {
-				if len(projected.Workers) >= maxProjectedWorkers {
-					truncatedWorkers = true
-					continue
-				}
-				w := &state.Workers[i]
-				projected.Workers = append(projected.Workers, projectedWorker{
-					Task: RedactText(w.Task), Project: RedactText(w.Project), Repository: RedactText(w.Repository), Status: RedactText(w.Status), Health: RedactText(w.Health), Agent: RedactText(w.Agent), Branch: RedactText(w.Branch), TDTask: validTDTask(w.TDTask), Worktree: RedactText(w.Worktree), UpdatedAt: w.UpdatedAt,
-					Message: projectFile(w.Message), Diagnostic: projectFile(w.Diagnostic), Log: projectFile(w.Log), Handoff: projectFile(w.Handoff), TD: projectFile(w.TD), Graphify: projectFile(w.Graphify), PullRequest: projectPullRequest(w.PullRequest), NoMistakes: projectTool(w.NoMistakes),
-					OCInject: projectedAudit{ResponsePending: w.OCInject.ResponsePending, ResponsePendingAt: w.OCInject.ResponsePendingAt, ResponseAcked: w.OCInject.ResponseAcked, ResponseAckedAt: w.OCInject.ResponseAckedAt, UpdatedAt: w.OCInject.UpdatedAt},
-				})
+				operationalWorkers = append(operationalWorkers, state.Workers[i])
 			}
 		}
 	}
 
-	// Diagnostic warnings for excluded inventory (truthful, not a sign of error).
+	// Phase 2: truncate operational workers at the safety limit.
+	truncatedWorkers := len(operationalWorkers) > maxProjectedWorkers
+	workerCount := min(len(operationalWorkers), maxProjectedWorkers)
+
+	// Phase 3: build diagnostic warnings (excluded inventory counts + raw warnings).
+	warnings := append([]string(nil), state.Warnings...)
 	if completeCount > 0 {
-		projected.Warnings = append(projected.Warnings, fmt.Sprintf("%d completed worker(s) excluded from overview", completeCount))
+		warnings = append(warnings, fmt.Sprintf("%d completed worker(s) excluded from overview", completeCount))
 	}
 	if staleCount > 0 {
-		projected.Warnings = append(projected.Warnings, fmt.Sprintf("%d stale worker(s) excluded from overview", staleCount))
+		warnings = append(warnings, fmt.Sprintf("%d stale worker(s) excluded from overview", staleCount))
 	}
 	if unknownCount > 0 {
-		projected.Warnings = append(projected.Warnings, fmt.Sprintf("%d unknown worker(s) excluded from overview", unknownCount))
+		warnings = append(warnings, fmt.Sprintf("%d unknown worker(s) excluded from overview", unknownCount))
 	}
-	for _, warning := range state.Warnings[:warningCount] {
-		projected.Warnings = append(projected.Warnings, RedactText(warning))
+	if truncatedWorkers {
+		warnings = append(warnings, "projection truncated at safety limit")
 	}
-	if len(state.Warnings) > warningCount || truncatedWorkers {
-		projected.Warnings = append(projected.Warnings, "projection truncated at safety limit")
+	groups, highest := projectWarningGroups(warnings, false)
+
+	projected := projectedState{CollectedAt: state.CollectedAt, Workers: make([]projectedSummary, 0, workerCount), Warnings: groups, HighestSeverity: highest}
+	for _, worker := range operationalWorkers[:workerCount] {
+		detailKey := worker.fleetProject
+		if detailKey == "" {
+			detailKey = worker.Repository
+		}
+		projected.Workers = append(projected.Workers, projectedSummary{Task: RedactText(worker.Task), Title: RedactText(worker.Title), Project: RedactText(worker.Project), Repository: RedactText(worker.Repository), Status: RedactText(worker.Status), Health: RedactText(worker.Health), Agent: RedactText(worker.Agent), TDTask: validTDTask(worker.TDTask), PullRequestState: RedactText(worker.PullRequest.State), DetailKey: RedactText(detailKey), UpdatedAt: worker.UpdatedAt})
 	}
 	return projected
+}
+
+func projectDiagnostics(warnings []string) projectedDiagnostics {
+	groups, highest := projectWarningGroups(warnings, true)
+	return projectedDiagnostics{Warnings: groups, HighestSeverity: highest}
+}
+
+func projectWarningGroups(warnings []string, includeItems bool) ([]projectedWarningGroup, string) {
+	type warningCategory struct {
+		category string
+		label    string
+		severity string
+		matches  func(string) bool
+	}
+	categories := []warningCategory{
+		{category: "collection-deadline", label: "collection deadlines", severity: "error", matches: func(value string) bool {
+			return strings.Contains(value, "deadline") || strings.Contains(value, "canceled")
+		}},
+		{category: "fleet-source", label: "unavailable fleet sources", severity: "error", matches: func(value string) bool {
+			return value == "fleet source unavailable"
+		}},
+		{category: "probe-failure", label: "probe failures", severity: "error", matches: func(value string) bool {
+			return strings.Contains(value, "probe") && (strings.Contains(value, "failed") || strings.Contains(value, "unavailable"))
+		}},
+		{category: "invalid-status", label: "invalid fleet statuses", severity: "warning", matches: func(value string) bool { return strings.Contains(value, "invalid status") }},
+		{category: "source", label: "missing or corrupt sources", severity: "warning", matches: func(value string) bool {
+			return strings.Contains(value, "missing") || strings.Contains(value, "corrupt") || strings.Contains(value, "source unavailable") || strings.Contains(value, "task ") && strings.Contains(value, " unavailable")
+		}},
+		{category: "truncation", label: "truncated collections", severity: "warning", matches: func(value string) bool { return strings.Contains(value, "truncated") }},
+		{category: "other", label: "other fleet diagnostics", severity: "warning", matches: func(string) bool { return true }},
+	}
+	grouped := make(map[string]*projectedWarningGroup, len(categories))
+	remainingItems := maxProjectedWarnings
+	for _, raw := range warnings {
+		warning := RedactText(raw)
+		for _, category := range categories {
+			if !category.matches(strings.ToLower(warning)) {
+				continue
+			}
+			group := grouped[category.category]
+			if group == nil {
+				group = &projectedWarningGroup{Category: category.category, Severity: category.severity}
+				grouped[category.category] = group
+			}
+			group.Count++
+			if includeItems {
+				if remainingItems > 0 {
+					group.Items = append(group.Items, warning)
+					remainingItems--
+				} else {
+					group.Truncated = true
+				}
+			}
+			break
+		}
+	}
+	result := make([]projectedWarningGroup, 0, len(grouped))
+	highest := ""
+	for _, category := range categories {
+		group := grouped[category.category]
+		if group == nil {
+			continue
+		}
+		group.Label = fmt.Sprintf("%d %s", group.Count, category.label)
+		result = append(result, *group)
+		if highest == "" || group.Severity == "error" {
+			highest = group.Severity
+		}
+	}
+	return result, highest
+}
+
+func projectWorker(worker Worker) projectedWorker {
+	return projectedWorker{
+		Task: RedactText(worker.Task), Title: RedactText(worker.Title), Project: RedactText(worker.Project), Repository: RedactText(worker.Repository), Status: RedactText(worker.Status), Health: RedactText(worker.Health), Agent: RedactText(worker.Agent), Branch: RedactText(worker.Branch), TDTask: validTDTask(worker.TDTask), Worktree: RedactText(worker.Worktree), UpdatedAt: worker.UpdatedAt,
+		Message: projectFile(worker.Message), Diagnostic: projectFile(worker.Diagnostic), Log: projectFile(worker.Log), Handoff: projectFile(worker.Handoff), TD: projectFile(worker.TD), Graphify: projectFile(worker.Graphify), PullRequest: projectPullRequest(worker.PullRequest), NoMistakes: projectTool(worker.NoMistakes),
+		OCInject: projectedAudit{ResponsePending: worker.OCInject.ResponsePending, ResponsePendingAt: worker.OCInject.ResponsePendingAt, ResponseAcked: worker.OCInject.ResponseAcked, ResponseAckedAt: worker.OCInject.ResponseAckedAt, UpdatedAt: worker.OCInject.UpdatedAt},
+	}
 }
 
 func projectFile(file FileMetadata) projectedFile {
@@ -181,7 +291,7 @@ func projectPullRequest(pr PullRequest) projectedPullRequest {
 	}
 	projected := projectedPullRequest{URL: canonicalPullRequestURL(pr.URL), State: RedactText(pr.State), Status: status, Checks: make([]projectedCheck, 0, checkCount), Comments: make([]projectedComment, 0, commentCount)}
 	for _, check := range pr.Checks[:checkCount] {
-		projected.Checks = append(projected.Checks, projectedCheck{Name: RedactText(check.Name), Status: RedactText(check.Status), Conclusion: RedactText(check.Conclusion), State: RedactText(check.State)})
+		projected.Checks = append(projected.Checks, projectedCheck{Name: RedactText(check.Name), Context: RedactText(check.Context), Status: RedactText(check.Status), Conclusion: RedactText(check.Conclusion), State: RedactText(check.State)})
 	}
 	for _, comment := range pr.Comments[:commentCount] {
 		projected.Comments = append(projected.Comments, projectedComment{Author: RedactText(comment.Author), Body: RedactText(comment.Body), URL: canonicalGitHubURL(comment.URL), CreatedAt: comment.CreatedAt})
@@ -286,6 +396,7 @@ func RedactText(value string) string {
 			continue
 		}
 		line = credentialURL.ReplaceAllString(line, `${1}[REDACTED]@`)
+		line = authorization.ReplaceAllString(line, `${1}[REDACTED]`)
 		line = quotedDouble.ReplaceAllString(line, `${1}[REDACTED]`)
 		line = quotedSingle.ReplaceAllString(line, `${1}[REDACTED]`)
 		line = basicCredential.ReplaceAllString(line, `${1}[REDACTED]`)
@@ -337,7 +448,7 @@ func isSensitiveKey(key string, includeEnvironment bool) bool {
 	words := strings.FieldsFunc(strings.ToLower(normalized.String()), func(character rune) bool { return character == '_' })
 	for _, word := range words {
 		switch word {
-		case "authorization", "cookie", "credential", "password", "passwd", "prompt", "secret", "token":
+		case "auth", "authorization", "cookie", "credential", "password", "passwd", "prompt", "secret", "token":
 			return true
 		case "env", "environment":
 			if includeEnvironment {
@@ -355,17 +466,28 @@ func isSensitiveKey(key string, includeEnvironment bool) bool {
 	return false
 }
 
-func operationalFile(path string) FileMetadata {
-	file, err := os.Open(path)
-	if err != nil {
-		if !os.IsNotExist(err) {
-			return FileMetadata{Present: true, Summary: "[content unavailable: unreadable]", Status: "unreadable"}
-		}
+func rootOperationalFile(root *os.Root, path string) FileMetadata {
+	expected, lstatErr := root.Lstat(path)
+	if os.IsNotExist(lstatErr) || lstatErr == nil && expected.Mode()&os.ModeSymlink != 0 {
 		return FileMetadata{}
 	}
-	defer file.Close()
-	info, err := file.Stat()
+	if lstatErr != nil {
+		return FileMetadata{Present: true, Summary: "[content unavailable: unreadable]", Status: "unreadable"}
+	}
+	if !expected.Mode().IsRegular() {
+		return FileMetadata{Present: true, UpdatedAt: expected.ModTime().UTC(), Summary: "[content unavailable: corrupt]", Status: "corrupt"}
+	}
+	file, _, err := openRootRegular(root, path)
 	if err != nil {
+		return FileMetadata{Present: true, Summary: "[content unavailable: unreadable]", Status: "unreadable"}
+	}
+	defer file.Close()
+	return operationalFileContents(file, expected)
+}
+
+func operationalFileContents(file *os.File, expected os.FileInfo) FileMetadata {
+	info, err := file.Stat()
+	if err != nil || expected != nil && !os.SameFile(expected, info) {
 		return FileMetadata{Present: true, Summary: "[content unavailable: unreadable]", Status: "unreadable"}
 	}
 	if !info.Mode().IsRegular() {
