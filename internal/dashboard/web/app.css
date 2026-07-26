@@ -58,6 +58,9 @@ footer { display:flex; justify-content:space-between; margin-top:60px; padding:2
 footer span { color:var(--acid); }
 @media (max-width:700px) { header { min-height:140px; align-items:start; flex-direction:column; gap:25px; } .overview { grid-template-columns:repeat(3,1fr); } .overview p { grid-column:1/-1; justify-content:start; } .toolbar { align-items:start; flex-direction:column; gap:15px; } header,main,footer { width:min(100% - 24px,1180px); } :root { --drawer-w:100vw; } }
 
+/* Screen-reader-only: hides visually but keeps content in the DOM for assistive tech */
+.sr-only { position:absolute; width:1px; height:1px; padding:0; margin:-1px; overflow:hidden; clip:rect(0,0,0,0); white-space:nowrap; border:0; }
+
 /* ── Tech Debt section ─────────────────────────────────────────────────────── */
 .td-section { margin-top: 20px; }
 .td-section-header {

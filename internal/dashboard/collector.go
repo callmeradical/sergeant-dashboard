@@ -417,16 +417,25 @@ func collectWorker(dir, task, project string, now time.Time, staleAfter time.Dur
 		return worker, warnings
 	}
 	if isTerminal(worker.Status) {
-		worker.Health = "complete"
+		if worker.enrichable {
+			worker.Health = "complete"
+		} else {
+			worker.Health = "recycled"
+		}
 		return worker, warnings
 	}
 	if !worker.enrichable {
 		return worker, warnings
 	}
-	if !worker.UpdatedAt.IsZero() && now.Sub(worker.UpdatedAt) > staleAfter {
-		worker.Health = "stale"
-	} else if worker.Status != "" {
-		worker.Health = "active"
+	if worker.Status == "needs_input" || worker.Status == "blocked" {
+		worker.Health = "attention"
+	} else {
+		activityAt := latestTime(worker.UpdatedAt, latestTime(worker.Log.UpdatedAt, latestTime(worker.Message.UpdatedAt, worker.Diagnostic.UpdatedAt)))
+		if !activityAt.IsZero() && now.Sub(activityAt) > staleAfter {
+			worker.Health = "stale"
+		} else if worker.Status != "" {
+			worker.Health = "active"
+		}
 	}
 	return worker, warnings
 }
