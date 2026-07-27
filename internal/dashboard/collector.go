@@ -16,24 +16,30 @@ import (
 )
 
 const (
-	maxScalarBytes       = 4096
-	maxOperationalBytes  = 64 << 10
-	maxConcurrentWorkers = 8
-	maxEnrichmentBatches = 4
-	maxEnrichmentTime    = 12 * time.Second
+	maxScalarBytes         = 4096
+	maxOperationalBytes    = 64 << 10
+	maxConcurrentWorkers   = 8
+	maxEnrichmentBatches   = 4
+	maxEnrichmentTime      = 12 * time.Second
+	supervisorProbeTimeout = 2 * time.Second
 )
 
 var processProbeSlots = make(chan struct{}, 2*maxConcurrentWorkers)
 
 type Collector struct {
-	FleetRoot    string
-	StaleAfter   time.Duration
-	Now          func() time.Time
-	Run          Runner
-	ProbeTimeout time.Duration
+	FleetRoot         string
+	StaleAfter        time.Duration
+	Now               func() time.Time
+	Run               Runner
+	ProbeTimeout      time.Duration
+	InspectSupervisor SupervisorInspector
 }
 
 type Runner func(ctx context.Context, dir, name string, args ...string) ([]byte, error)
+
+// SupervisorInspector verifies whether a tmux pane is running the expected
+// sgt-worker process for the given fleet state directory.
+type SupervisorInspector func(ctx context.Context, pane, stateDir string) (bool, error)
 
 type State struct {
 	CollectedAt time.Time `json:"collectedAt"`
@@ -42,26 +48,28 @@ type State struct {
 }
 
 type Worker struct {
-	Task        string        `json:"task"`
-	Project     string        `json:"project"`
-	Repository  string        `json:"repository,omitempty"`
-	Status      string        `json:"status,omitempty"`
-	Health      string        `json:"health"`
-	Agent       string        `json:"agent,omitempty"`
-	Branch      string        `json:"branch,omitempty"`
-	TDTask      string        `json:"tdTask,omitempty"`
-	TD          FileMetadata  `json:"td"`
-	Worktree    string        `json:"worktree,omitempty"`
-	UpdatedAt   time.Time     `json:"updatedAt,omitempty"`
-	Message     FileMetadata  `json:"message"`
-	Diagnostic  FileMetadata  `json:"diagnostic"`
-	Log         FileMetadata  `json:"log"`
-	Handoff     FileMetadata  `json:"handoff"`
-	PullRequest PullRequest   `json:"pullRequest"`
-	NoMistakes  ToolStatus    `json:"noMistakes"`
-	Graphify    FileMetadata  `json:"graphify"`
-	OCInject    AuditMetadata `json:"ocInject"`
-	enrichable  bool
+	Task           string        `json:"task"`
+	Project        string        `json:"project"`
+	Repository     string        `json:"repository,omitempty"`
+	Status         string        `json:"status,omitempty"`
+	Health         string        `json:"health"`
+	Agent          string        `json:"agent,omitempty"`
+	Branch         string        `json:"branch,omitempty"`
+	TDTask         string        `json:"tdTask,omitempty"`
+	TD             FileMetadata  `json:"td"`
+	Worktree       string        `json:"worktree,omitempty"`
+	UpdatedAt      time.Time     `json:"updatedAt,omitempty"`
+	Message        FileMetadata  `json:"message"`
+	Diagnostic     FileMetadata  `json:"diagnostic"`
+	Log            FileMetadata  `json:"log"`
+	Handoff        FileMetadata  `json:"handoff"`
+	PullRequest    PullRequest   `json:"pullRequest"`
+	NoMistakes     ToolStatus    `json:"noMistakes"`
+	Graphify       FileMetadata  `json:"graphify"`
+	OCInject       AuditMetadata `json:"ocInject"`
+	enrichable     bool
+	supervisorPane string
+	stateDir       string
 }
 
 type FileMetadata struct {
@@ -137,7 +145,7 @@ func (c Collector) Collect(ctx context.Context) State {
 			if !project.IsDir() {
 				continue
 			}
-			worker, warnings := collectWorker(filepath.Join(c.FleetRoot, task.Name(), project.Name()), task.Name(), project.Name(), now, staleAfter)
+			worker, warnings := c.collectWorker(ctx, filepath.Join(c.FleetRoot, task.Name(), project.Name()), task.Name(), project.Name(), now, staleAfter)
 			state.Workers = append(state.Workers, worker)
 			state.Warnings = append(state.Warnings, warnings...)
 		}
@@ -148,8 +156,68 @@ func (c Collector) Collect(ctx context.Context) State {
 		}
 		return state.Workers[i].Task < state.Workers[j].Task
 	})
+	c.inspectWorkers(ctx, now, staleAfter, state.Workers)
 	c.enrichWorkers(ctx, state.Workers)
 	return state
+}
+
+func (c Collector) inspectWorkers(ctx context.Context, now time.Time, staleAfter time.Duration, workers []Worker) {
+	inspectionCount := 0
+	for index := range workers {
+		if workers[index].supervisorPane != "" {
+			inspectionCount++
+		}
+	}
+	if inspectionCount == 0 {
+		return
+	}
+
+	inspect := c.InspectSupervisor
+	if inspect == nil {
+		inspect = inspectSupervisor
+	}
+	probeTimeout := supervisorProbeTimeout
+
+	workerCount := min(maxConcurrentWorkers, inspectionCount)
+	jobs := make(chan *Worker)
+	var wait sync.WaitGroup
+	wait.Add(workerCount)
+	for range workerCount {
+		go func() {
+			defer wait.Done()
+			for worker := range jobs {
+				inspectCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), probeTimeout)
+				live, err := inspect(inspectCtx, worker.supervisorPane, worker.stateDir)
+				cancel()
+				activityAt := latestTime(worker.UpdatedAt, latestTime(worker.Log.UpdatedAt, latestTime(worker.Message.UpdatedAt, worker.Diagnostic.UpdatedAt)))
+				if err == nil && live {
+					worker.Health = "active"
+				} else {
+					worker.Health = ageHealth(activityAt, now, staleAfter)
+				}
+			}
+		}()
+	}
+	for index := range workers {
+		if workers[index].supervisorPane == "" {
+			continue
+		}
+		select {
+		case jobs <- &workers[index]:
+		case <-ctx.Done():
+			workers[index].Health = ageHealth(workers[index].UpdatedAt, now, staleAfter)
+			for remaining := index + 1; remaining < len(workers); remaining++ {
+				if workers[remaining].supervisorPane != "" {
+					workers[remaining].Health = ageHealth(workers[remaining].UpdatedAt, now, staleAfter)
+				}
+			}
+			close(jobs)
+			wait.Wait()
+			return
+		}
+	}
+	close(jobs)
+	wait.Wait()
 }
 
 func (c Collector) enrichWorkers(ctx context.Context, workers []Worker) {
@@ -385,7 +453,7 @@ func (buffer *boundedBuffer) Write(data []byte) (int, error) {
 	return written, nil
 }
 
-func collectWorker(dir, task, project string, now time.Time, staleAfter time.Duration) (Worker, []string) {
+func (c Collector) collectWorker(ctx context.Context, dir, task, project string, now time.Time, staleAfter time.Duration) (Worker, []string) {
 	worker := Worker{Task: task, Project: project, Health: "orphaned"}
 	warnings := []string{}
 	var err error
@@ -427,17 +495,111 @@ func collectWorker(dir, task, project string, now time.Time, staleAfter time.Dur
 	if !worker.enrichable {
 		return worker, warnings
 	}
-	if worker.Status == "needs_input" || worker.Status == "blocked" {
-		worker.Health = "attention"
-	} else {
-		activityAt := latestTime(worker.UpdatedAt, latestTime(worker.Log.UpdatedAt, latestTime(worker.Message.UpdatedAt, worker.Diagnostic.UpdatedAt)))
-		if !activityAt.IsZero() && now.Sub(activityAt) > staleAfter {
-			worker.Health = "stale"
-		} else if worker.Status != "" {
-			worker.Health = "active"
-		}
+
+	activityAt := latestTime(worker.UpdatedAt, latestTime(worker.Log.UpdatedAt, latestTime(worker.Message.UpdatedAt, worker.Diagnostic.UpdatedAt)))
+
+	pane, _, _ := readScalarWithTime(filepath.Join(dir, "pane"))
+	if pane != "" {
+		worker.Health = ageHealth(activityAt, now, staleAfter)
+		worker.supervisorPane = pane
+		worker.stateDir = dir
+		return worker, warnings
+	}
+
+	if !activityAt.IsZero() && now.Sub(activityAt) > staleAfter {
+		worker.Health = "stale"
+	} else if worker.Status != "" {
+		worker.Health = "active"
 	}
 	return worker, warnings
+}
+
+// ageHealth returns "stale" if activityAt is more than staleAfter in the past,
+// and "orphaned" otherwise. Used when a supervisor pane is unavailable or dead.
+func ageHealth(activityAt, now time.Time, staleAfter time.Duration) string {
+	if !activityAt.IsZero() && now.Sub(activityAt) > staleAfter {
+		return "stale"
+	}
+	return "orphaned"
+}
+
+// inspectSupervisor is the real supervisor inspector that queries tmux.
+func inspectSupervisor(ctx context.Context, pane, stateDir string) (bool, error) {
+	output, err := runCommand(ctx, "", "tmux", "display-message", "-p", "-t", pane, "#{pane_dead}|#{pane_start_command}")
+	if err != nil {
+		return false, err
+	}
+	return ParseSupervisorEvidence(strings.TrimSpace(string(output)), stateDir)
+}
+
+// ParseSupervisorEvidence parses tmux pane_dead and pane_start_command output
+// to determine whether the pane is running an sgt-worker process for stateDir.
+// output has the form "<0|1>|<pane_start_command>".
+func ParseSupervisorEvidence(output, stateDir string) (bool, error) {
+	dead, command, found := strings.Cut(output, "|")
+	if !found || (dead != "0" && dead != "1") {
+		return false, fmt.Errorf("invalid supervisor evidence")
+	}
+	if dead != "0" {
+		return false, nil
+	}
+	fields, err := shellFields(command)
+	if err != nil {
+		return false, err
+	}
+	// sgt-worker <stateDir> [<worktree> [<agent> [<initial_message>]]]
+	if len(fields) >= 2 && filepath.Base(fields[0]) == "sgt-worker" && fields[1] == stateDir {
+		return true, nil
+	}
+	return false, nil
+}
+
+// shellFields splits a POSIX-shell-style command string into fields,
+// handling single quotes, double quotes, and backslash escapes.
+func shellFields(command string) ([]string, error) {
+	fields := []string{}
+	var field strings.Builder
+	quote := rune(0)
+	escaped := false
+	flush := func() {
+		if field.Len() > 0 {
+			fields = append(fields, field.String())
+			field.Reset()
+		}
+	}
+	for _, character := range command {
+		if escaped {
+			field.WriteRune(character)
+			escaped = false
+			continue
+		}
+		if character == '\\' && quote != '\'' {
+			escaped = true
+			continue
+		}
+		if quote != 0 {
+			if character == quote {
+				quote = 0
+			} else {
+				field.WriteRune(character)
+			}
+			continue
+		}
+		if character == '\'' || character == '"' {
+			quote = character
+			continue
+		}
+		if character == ' ' || character == '\t' || character == '\n' {
+			flush()
+			continue
+		}
+		field.WriteRune(character)
+	}
+	if escaped || quote != 0 {
+		return nil, fmt.Errorf("invalid supervisor command")
+	}
+	flush()
+	return fields, nil
 }
 
 func readScalarWithTime(path string) (string, time.Time, error) {

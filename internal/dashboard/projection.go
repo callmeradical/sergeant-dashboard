@@ -104,22 +104,63 @@ var (
 	secretValue     = regexp.MustCompile(`(?i)(bearer\s+)[^\s,;]+|((?:api[_-]?key|credential|password|secret|token)\s*[:=]\s*)[^\s,;]+|AKIA[A-Z0-9]{16}|gh[pousr]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,}|npm_[A-Za-z0-9]{20,}|sk-[A-Za-z0-9_-]{20,}|xox[baprs]-[A-Za-z0-9-]{20,}`)
 )
 
+// isOperational reports whether a worker is part of the operational set:
+// exact-supervisor-verified live workers (active) and actionable non-terminal
+// records (orphaned). Completed, stale historical, and unknown malformed
+// inventory are excluded from the overview and board.
+func isOperational(health string) bool {
+	return health == "active" || health == "orphaned"
+}
+
 func projectState(state State) projectedState {
-	workerCount := min(len(state.Workers), maxProjectedWorkers)
 	warningCount := min(len(state.Warnings), maxProjectedWarnings)
-	projected := projectedState{CollectedAt: state.CollectedAt, Workers: make([]projectedWorker, 0, workerCount), Warnings: make([]string, 0, warningCount+1)}
+	projected := projectedState{CollectedAt: state.CollectedAt, Workers: []projectedWorker{}, Warnings: make([]string, 0)}
+
+	// Pass 1: scan all workers, count excluded health classes for diagnostics,
+	// then collect operational workers up to the safety limit. Filtering happens
+	// before truncation so active workers are never dropped behind a wall of
+	// stale/complete/unknown inventory.
+	var completeCount, staleCount, unknownCount int
+	truncatedWorkers := false
+	for i := range state.Workers {
+		switch state.Workers[i].Health {
+		case "complete":
+			completeCount++
+		case "stale":
+			staleCount++
+		case "unknown":
+			unknownCount++
+		default:
+			if isOperational(state.Workers[i].Health) {
+				if len(projected.Workers) >= maxProjectedWorkers {
+					truncatedWorkers = true
+					continue
+				}
+				w := &state.Workers[i]
+				projected.Workers = append(projected.Workers, projectedWorker{
+					Task: RedactText(w.Task), Project: RedactText(w.Project), Repository: RedactText(w.Repository), Status: RedactText(w.Status), Health: RedactText(w.Health), Agent: RedactText(w.Agent), Branch: RedactText(w.Branch), TDTask: validTDTask(w.TDTask), Worktree: RedactText(w.Worktree), UpdatedAt: w.UpdatedAt,
+					Message: projectFile(w.Message), Diagnostic: projectFile(w.Diagnostic), Log: projectFile(w.Log), Handoff: projectFile(w.Handoff), TD: projectFile(w.TD), Graphify: projectFile(w.Graphify), PullRequest: projectPullRequest(w.PullRequest), NoMistakes: projectTool(w.NoMistakes),
+					OCInject: projectedAudit{ResponsePending: w.OCInject.ResponsePending, ResponsePendingAt: w.OCInject.ResponsePendingAt, ResponseAcked: w.OCInject.ResponseAcked, ResponseAckedAt: w.OCInject.ResponseAckedAt, UpdatedAt: w.OCInject.UpdatedAt},
+				})
+			}
+		}
+	}
+
+	// Diagnostic warnings for excluded inventory (truthful, not a sign of error).
+	if completeCount > 0 {
+		projected.Warnings = append(projected.Warnings, fmt.Sprintf("%d completed worker(s) excluded from overview", completeCount))
+	}
+	if staleCount > 0 {
+		projected.Warnings = append(projected.Warnings, fmt.Sprintf("%d stale worker(s) excluded from overview", staleCount))
+	}
+	if unknownCount > 0 {
+		projected.Warnings = append(projected.Warnings, fmt.Sprintf("%d unknown worker(s) excluded from overview", unknownCount))
+	}
 	for _, warning := range state.Warnings[:warningCount] {
 		projected.Warnings = append(projected.Warnings, RedactText(warning))
 	}
-	if len(state.Warnings) > warningCount || len(state.Workers) > workerCount {
+	if len(state.Warnings) > warningCount || truncatedWorkers {
 		projected.Warnings = append(projected.Warnings, "projection truncated at safety limit")
-	}
-	for _, worker := range state.Workers[:workerCount] {
-		projected.Workers = append(projected.Workers, projectedWorker{
-			Task: RedactText(worker.Task), Project: RedactText(worker.Project), Repository: RedactText(worker.Repository), Status: RedactText(worker.Status), Health: RedactText(worker.Health), Agent: RedactText(worker.Agent), Branch: RedactText(worker.Branch), TDTask: validTDTask(worker.TDTask), Worktree: RedactText(worker.Worktree), UpdatedAt: worker.UpdatedAt,
-			Message: projectFile(worker.Message), Diagnostic: projectFile(worker.Diagnostic), Log: projectFile(worker.Log), Handoff: projectFile(worker.Handoff), TD: projectFile(worker.TD), Graphify: projectFile(worker.Graphify), PullRequest: projectPullRequest(worker.PullRequest), NoMistakes: projectTool(worker.NoMistakes),
-			OCInject: projectedAudit{ResponsePending: worker.OCInject.ResponsePending, ResponsePendingAt: worker.OCInject.ResponsePendingAt, ResponseAcked: worker.OCInject.ResponseAcked, ResponseAckedAt: worker.OCInject.ResponseAckedAt, UpdatedAt: worker.OCInject.UpdatedAt},
-		})
 	}
 	return projected
 }
