@@ -57,6 +57,76 @@ func TestCollectorProbesWorkersConcurrently(t *testing.T) {
 	}
 }
 
+// TestEnrichWorkersBoundsToMaxConcurrentWorkers verifies that with 20 enrichable
+// workers, no more than 8 workers are ever being enriched at the same time.
+// It measures this by sampling goroutine growth while a slow runner is active:
+// a semaphore of size 8 means at most 8 goroutines call enrichWorker, each of
+// which may spawn up to 4 probe goroutines, giving growth ≤ 8 + 8×4 = 40.
+// Without the semaphore fix (one goroutine per worker), growth would reach
+// 20 + 20×4 = 100.
+func TestEnrichWorkersBoundsToMaxConcurrentWorkers(t *testing.T) {
+	root := t.TempDir()
+	const workerCount = 20
+	for index := 0; index < workerCount; index++ {
+		worker := filepath.Join(root, fmt.Sprintf("task-%02d", index), "api")
+		worktree := filepath.Join(root, fmt.Sprintf("worktree-%02d", index))
+		mustMkdirAll(t, worker)
+		mustMkdirAll(t, worktree)
+		writeFile(t, filepath.Join(worker, "status"), "in_progress\n")
+		writeFile(t, filepath.Join(worker, "worktree"), worktree+"\n")
+	}
+
+	release := make(chan struct{})
+	ready := make(chan struct{})
+	var active atomic.Int32
+	var once sync.Once
+	runner := func(ctx context.Context, _ string, _ string, _ ...string) ([]byte, error) {
+		if active.Add(1) == 16 { // process-wide slot ceiling reached
+			once.Do(func() { close(ready) })
+		}
+		defer active.Add(-1)
+		select {
+		case <-release:
+			return []byte(`{}`), nil
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+
+	baseline := runtime.NumGoroutine()
+	done := make(chan struct{})
+	go func() {
+		dashboard.Collector{FleetRoot: root, Run: runner, ProbeTimeout: 5 * time.Second}.Collect(t.Context())
+		close(done)
+	}()
+	select {
+	case <-ready:
+	case <-time.After(2 * time.Second):
+		close(release)
+		t.Fatal("collector did not saturate the process-wide probe limit")
+	}
+
+	// Sample goroutine growth while at peak load.
+	growth := runtime.NumGoroutine() - baseline
+	close(release)
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("collector did not finish after release")
+	}
+
+	// With 20 workers bounded to 8 concurrent by the semaphore:
+	//   8 semaphore goroutines + 8 × 4 probe goroutines = 40 goroutine growth.
+	// Without the bound (20 goroutines), growth would exceed 40 (up to 100).
+	const maxGrowth = 40
+	if growth > maxGrowth {
+		t.Fatalf("goroutine growth = %d with 20 workers, want ≤ %d (semaphore pool must limit to 8 concurrent)", growth, maxGrowth)
+	}
+	if got := active.Load(); got != 0 {
+		t.Fatalf("active probes after collection = %d, want 0", got)
+	}
+}
+
 func TestCollectorsShareProcessWideProbeLimit(t *testing.T) {
 	root := t.TempDir()
 	for index := 0; index < 8; index++ {
