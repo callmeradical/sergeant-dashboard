@@ -57,13 +57,11 @@ func TestCollectorProbesWorkersConcurrently(t *testing.T) {
 	}
 }
 
-// TestEnrichWorkersBoundsToMaxConcurrentWorkers verifies that with 20 enrichable
-// workers, no more than 8 workers are ever being enriched at the same time.
-// It measures this by sampling goroutine growth while a slow runner is active:
-// a semaphore of size 8 means at most 8 goroutines call enrichWorker, each of
-// which may spawn up to 4 probe goroutines, giving growth ≤ 8 + 8×4 = 40.
-// Without the semaphore fix (one goroutine per worker), growth would reach
-// 20 + 20×4 = 100.
+// TestEnrichWorkersBoundsToMaxConcurrentWorkers verifies that a 20-worker fleet
+// still bounds enrichment goroutines to maxConcurrentWorkers.
+// It samples goroutine growth while probes are blocked. With an 8-worker
+// dispatcher, growth should stay at or below 40 goroutines instead of scaling
+// linearly with the fleet size.
 func TestEnrichWorkersBoundsToMaxConcurrentWorkers(t *testing.T) {
 	root := t.TempDir()
 	const workerCount = 20
@@ -115,12 +113,11 @@ func TestEnrichWorkersBoundsToMaxConcurrentWorkers(t *testing.T) {
 		t.Fatal("collector did not finish after release")
 	}
 
-	// With 20 workers bounded to 8 concurrent by the semaphore:
-	//   8 semaphore goroutines + 8 × 4 probe goroutines = 40 goroutine growth.
-	// Without the bound (20 goroutines), growth would exceed 40 (up to 100).
+	// With 20 workers bounded to 8 concurrent by the semaphore, goroutine growth
+	// stays capped at 40 instead of tracking the full fleet size.
 	const maxGrowth = 40
 	if growth > maxGrowth {
-		t.Fatalf("goroutine growth = %d with 20 workers, want ≤ %d (semaphore pool must limit to 8 concurrent)", growth, maxGrowth)
+		t.Fatalf("goroutine growth = %d with 20 workers, want <= %d (semaphore pool must limit to 8 concurrent)", growth, maxGrowth)
 	}
 	if got := active.Load(); got != 0 {
 		t.Fatalf("active probes after collection = %d, want 0", got)
@@ -1022,7 +1019,6 @@ func TestCollectorClassifiesActiveWithLiveSupervisorAndOrphanedWithoutIt(t *test
 
 	var inspectedMu sync.Mutex
 	inspected := make(map[string]int)
-	var inspectedMu sync.Mutex
 	collector := dashboard.Collector{
 		FleetRoot:  root,
 		Now:        func() time.Time { return now },
