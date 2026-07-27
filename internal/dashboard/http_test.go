@@ -309,6 +309,33 @@ func TestStateAPIProjectsBlockedLifecycleStatus(t *testing.T) {
 	}
 }
 
+// TestStateAPIFiltersBeforeTruncating verifies that operational-set filtering
+// happens before the maxProjectedWorkers safety truncation, so active workers
+// past position 1000 in a large fleet are not silently dropped.
+func TestStateAPIFiltersBeforeTruncating(t *testing.T) {
+	// Build a state with 1002 workers: 1000 stale followed by 2 active.
+	// If truncation precedes filtering the 2 active workers never appear.
+	workers := make([]dashboard.Worker, 1002)
+	for i := range 1000 {
+		workers[i] = dashboard.Worker{Task: fmt.Sprintf("stale-%04d", i), Health: "stale", Status: "in_progress"}
+	}
+	workers[1000] = dashboard.Worker{Task: "active-tail-0", Health: "active", Status: "in_progress"}
+	workers[1001] = dashboard.Worker{Task: "active-tail-1", Health: "active", Status: "in_progress"}
+
+	state := dashboard.State{Workers: workers, Warnings: []string{}}
+	response := request(t, dashboard.NewHandler(fixedSource{state: state}), http.MethodGet, "/sergeant/api/state")
+	if response.Code != http.StatusOK {
+		t.Fatalf("state response = %d", response.Code)
+	}
+	body := response.Body.String()
+	if !strings.Contains(body, `"task":"active-tail-0"`) || !strings.Contains(body, `"task":"active-tail-1"`) {
+		t.Errorf("active workers past position 1000 were dropped (truncated before filtered): %s", body[:min(200, len(body))])
+	}
+	if strings.Contains(body, `"health":"stale"`) {
+		t.Errorf("stale workers leaked into operational set: %s", body[:min(200, len(body))])
+	}
+}
+
 // TestStateAPIProjectsOnlyOperationalWorkersFromMixedHistory reproduces the
 // 154-record live failure: the API should return only the operational set
 // (verified active workers and actionable orphaned records), not the full

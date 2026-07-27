@@ -113,22 +113,35 @@ func isOperational(health string) bool {
 }
 
 func projectState(state State) projectedState {
-	workerCount := min(len(state.Workers), maxProjectedWorkers)
 	warningCount := min(len(state.Warnings), maxProjectedWarnings)
-	projected := projectedState{CollectedAt: state.CollectedAt, Workers: make([]projectedWorker, 0, workerCount), Warnings: make([]string, 0, warningCount+1)}
+	projected := projectedState{CollectedAt: state.CollectedAt, Workers: []projectedWorker{}, Warnings: make([]string, 0)}
 
-	// Count excluded inventory for diagnostic warnings.
+	// Pass 1: scan all workers, count excluded health classes for diagnostics,
+	// then collect operational workers up to the safety limit. Filtering happens
+	// before truncation so active workers are never dropped behind a wall of
+	// stale/complete/unknown inventory.
 	var completeCount, staleCount, unknownCount int
-	for _, worker := range state.Workers[:workerCount] {
-		switch worker.Health {
+	for i := range state.Workers {
+		switch state.Workers[i].Health {
 		case "complete":
 			completeCount++
 		case "stale":
 			staleCount++
 		case "unknown":
 			unknownCount++
+		default:
+			if isOperational(state.Workers[i].Health) && len(projected.Workers) < maxProjectedWorkers {
+				w := &state.Workers[i]
+				projected.Workers = append(projected.Workers, projectedWorker{
+					Task: RedactText(w.Task), Project: RedactText(w.Project), Repository: RedactText(w.Repository), Status: RedactText(w.Status), Health: RedactText(w.Health), Agent: RedactText(w.Agent), Branch: RedactText(w.Branch), TDTask: validTDTask(w.TDTask), Worktree: RedactText(w.Worktree), UpdatedAt: w.UpdatedAt,
+					Message: projectFile(w.Message), Diagnostic: projectFile(w.Diagnostic), Log: projectFile(w.Log), Handoff: projectFile(w.Handoff), TD: projectFile(w.TD), Graphify: projectFile(w.Graphify), PullRequest: projectPullRequest(w.PullRequest), NoMistakes: projectTool(w.NoMistakes),
+					OCInject: projectedAudit{ResponsePending: w.OCInject.ResponsePending, ResponsePendingAt: w.OCInject.ResponsePendingAt, ResponseAcked: w.OCInject.ResponseAcked, ResponseAckedAt: w.OCInject.ResponseAckedAt, UpdatedAt: w.OCInject.UpdatedAt},
+				})
+			}
 		}
 	}
+
+	// Diagnostic warnings for excluded inventory (truthful, not a sign of error).
 	if completeCount > 0 {
 		projected.Warnings = append(projected.Warnings, fmt.Sprintf("%d completed worker(s) excluded from overview", completeCount))
 	}
@@ -138,22 +151,11 @@ func projectState(state State) projectedState {
 	if unknownCount > 0 {
 		projected.Warnings = append(projected.Warnings, fmt.Sprintf("%d unknown worker(s) excluded from overview", unknownCount))
 	}
-
 	for _, warning := range state.Warnings[:warningCount] {
 		projected.Warnings = append(projected.Warnings, RedactText(warning))
 	}
-	if len(state.Warnings) > warningCount || len(state.Workers) > workerCount {
+	if len(state.Warnings) > warningCount || len(projected.Workers) >= maxProjectedWorkers {
 		projected.Warnings = append(projected.Warnings, "projection truncated at safety limit")
-	}
-	for _, worker := range state.Workers[:workerCount] {
-		if !isOperational(worker.Health) {
-			continue
-		}
-		projected.Workers = append(projected.Workers, projectedWorker{
-			Task: RedactText(worker.Task), Project: RedactText(worker.Project), Repository: RedactText(worker.Repository), Status: RedactText(worker.Status), Health: RedactText(worker.Health), Agent: RedactText(worker.Agent), Branch: RedactText(worker.Branch), TDTask: validTDTask(worker.TDTask), Worktree: RedactText(worker.Worktree), UpdatedAt: worker.UpdatedAt,
-			Message: projectFile(worker.Message), Diagnostic: projectFile(worker.Diagnostic), Log: projectFile(worker.Log), Handoff: projectFile(worker.Handoff), TD: projectFile(worker.TD), Graphify: projectFile(worker.Graphify), PullRequest: projectPullRequest(worker.PullRequest), NoMistakes: projectTool(worker.NoMistakes),
-			OCInject: projectedAudit{ResponsePending: worker.OCInject.ResponsePending, ResponsePendingAt: worker.OCInject.ResponsePendingAt, ResponseAcked: worker.OCInject.ResponseAcked, ResponseAckedAt: worker.OCInject.ResponseAckedAt, UpdatedAt: worker.OCInject.UpdatedAt},
-		})
 	}
 	return projected
 }

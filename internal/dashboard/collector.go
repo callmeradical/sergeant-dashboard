@@ -444,7 +444,9 @@ func (c Collector) collectWorker(ctx context.Context, dir, task, project string,
 		}
 		live, err := inspect(ctx, pane, dir)
 		if err != nil {
-			// Inspection unavailable; fall back to timestamp-based classification.
+			// Inspection unavailable (e.g. tmux not running); fall back to
+			// timestamp-based classification so the worker is not silently
+			// excluded from the operational set.
 			worker.Health = ageHealth(activityAt, now, staleAfter)
 			return worker, warnings
 		}
