@@ -1264,6 +1264,96 @@ func TestCollectorHonorsConfiguredEnrichmentProbeTimeout(t *testing.T) {
 	}
 }
 
+// Regression tests for td-9782c5: Collector.Collect must apply limit before
+// materializing the full fleet and must check ctx during the scan walk.
+
+func TestCollectorAppliesLimitBeforeEnrichment(t *testing.T) {
+	root := t.TempDir()
+	const totalWorkers = 10
+	for i := 0; i < totalWorkers; i++ {
+		worker := filepath.Join(root, fmt.Sprintf("task-%02d", i), "api")
+		worktree := filepath.Join(root, fmt.Sprintf("worktree-%02d", i))
+		mustMkdirAll(t, worker)
+		mustMkdirAll(t, worktree)
+		writeFile(t, filepath.Join(worker, "status"), "in_progress\n")
+		writeFile(t, filepath.Join(worker, "worktree"), worktree+"\n")
+	}
+
+	var enriched atomic.Int32
+	runner := func(_ context.Context, _ string, _ string, _ ...string) ([]byte, error) {
+		enriched.Add(1)
+		return []byte(`{}`), nil
+	}
+
+	const limit = 3
+	state := dashboard.Collector{
+		FleetRoot: root,
+		Run:       runner,
+		Limit:     limit,
+	}.Collect(t.Context())
+
+	if len(state.Workers) != limit {
+		t.Fatalf("workers = %d, want limit %d applied before enrichment", len(state.Workers), limit)
+	}
+	// Each enrichable worker triggers 3 probes (gh, no-mistakes, git-remote); with a
+	// limit of 3, at most limit*3 probes should execute, not totalWorkers*3.
+	const probesPerWorker = 3
+	if got := enriched.Load(); got > int32(limit*probesPerWorker) {
+		t.Fatalf("enrichment probes = %d, want at most %d (limit %d * %d probes/worker); limit must apply before enrichment", got, limit*probesPerWorker, limit, probesPerWorker)
+	}
+}
+
+func TestCollectorChecksContextDuringFleetWalk(t *testing.T) {
+	root := t.TempDir()
+	const totalWorkers = 20
+	for i := 0; i < totalWorkers; i++ {
+		worker := filepath.Join(root, fmt.Sprintf("task-%02d", i), "api")
+		mustMkdirAll(t, worker)
+		writeFile(t, filepath.Join(worker, "status"), "in_progress\n")
+	}
+
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel() // cancel before Collect starts
+
+	state := dashboard.Collector{FleetRoot: root}.Collect(ctx)
+	if len(state.Workers) == totalWorkers {
+		t.Fatalf("collect walked all %d workers despite cancelled context; want early exit", totalWorkers)
+	}
+}
+
+// Regression test for td-bd77c2: Check must preserve statusCheckRollup.context
+// so legacy GitHub status checks retain their identifier.
+
+func TestCollectorPreservesLegacyStatusContextName(t *testing.T) {
+	root := t.TempDir()
+	worker := filepath.Join(root, "task-a", "api")
+	worktree := filepath.Join(root, "worktree")
+	mustMkdirAll(t, worker)
+	mustMkdirAll(t, worktree)
+	writeFile(t, filepath.Join(worker, "status"), "in_progress\n")
+	writeFile(t, filepath.Join(worker, "worktree"), worktree+"\n")
+	writeFile(t, filepath.Join(worker, "repository"), "acme/api\n")
+
+	runner := func(_ context.Context, _ string, name string, _ ...string) ([]byte, error) {
+		if name == "gh" {
+			return []byte(`{"url":"https://github.com/acme/api/pull/1","state":"OPEN","statusCheckRollup":[{"context":"legacy-ci","state":"PENDING","description":"Tests running"}],"comments":[]}`), nil
+		}
+		return []byte(`{}`), nil
+	}
+
+	state := dashboard.Collector{FleetRoot: root, Run: runner}.Collect(t.Context())
+	if len(state.Workers) == 0 {
+		t.Fatal("no workers collected")
+	}
+	checks := state.Workers[0].PullRequest.Checks
+	if len(checks) != 1 {
+		t.Fatalf("checks = %d, want 1", len(checks))
+	}
+	if checks[0].Context != "legacy-ci" {
+		t.Fatalf("legacy check context = %q, want %q; legacy status checks must retain their context identifier", checks[0].Context, "legacy-ci")
+	}
+}
+
 func mustMkdirAll(t *testing.T, path string) {
 	t.Helper()
 	if err := os.MkdirAll(path, 0o755); err != nil {

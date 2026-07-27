@@ -33,6 +33,9 @@ type Collector struct {
 	Run               Runner
 	ProbeTimeout      time.Duration
 	InspectSupervisor SupervisorInspector
+	// Limit caps the number of workers materialised during the fleet scan.
+	// Zero or negative means no limit.
+	Limit int
 }
 
 type Runner func(ctx context.Context, dir, name string, args ...string) ([]byte, error)
@@ -96,6 +99,7 @@ type Comment struct {
 
 type Check struct {
 	Name       string `json:"name,omitempty"`
+	Context    string `json:"context,omitempty"`
 	Status     string `json:"status,omitempty"`
 	Conclusion string `json:"conclusion,omitempty"`
 	State      string `json:"state,omitempty"`
@@ -132,7 +136,13 @@ func (c Collector) Collect(ctx context.Context) State {
 		state.Warnings = append(state.Warnings, "fleet source unavailable")
 		return state
 	}
+outer:
 	for _, task := range tasks {
+		select {
+		case <-ctx.Done():
+			break outer
+		default:
+		}
 		if !task.IsDir() {
 			continue
 		}
@@ -144,6 +154,14 @@ func (c Collector) Collect(ctx context.Context) State {
 		for _, project := range projects {
 			if !project.IsDir() {
 				continue
+			}
+			select {
+			case <-ctx.Done():
+				break outer
+			default:
+			}
+			if c.Limit > 0 && len(state.Workers) >= c.Limit {
+				break outer
 			}
 			worker, warnings := c.collectWorker(ctx, filepath.Join(c.FleetRoot, task.Name(), project.Name()), task.Name(), project.Name(), now, staleAfter)
 			state.Workers = append(state.Workers, worker)
