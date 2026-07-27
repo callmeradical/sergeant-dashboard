@@ -463,7 +463,7 @@ func TestCollectorPreservesOCInjectMetadataForNonEnrichableWorkers(t *testing.T)
 		wantHealth string
 	}{
 		{name: "active", status: "in_progress", wantStatus: "in_progress", wantHealth: "orphaned"},
-		{name: "terminal", status: "done", worktree: filepath.Join(root, "removed-terminal"), wantStatus: "done", wantHealth: "complete"},
+		{name: "terminal", status: "done", worktree: filepath.Join(root, "removed-terminal"), wantStatus: "done", wantHealth: "recycled"},
 		{name: "unknown", status: "invalid", worktree: filepath.Join(root, "removed-unknown"), wantStatus: "unknown", wantHealth: "unknown"},
 		{name: "orphaned", status: "orphaned", worktree: filepath.Join(root, "removed-orphaned"), wantStatus: "orphaned", wantHealth: "orphaned"},
 	}
@@ -694,9 +694,9 @@ func TestCollectorClassifiesTerminalWorkersCompleteAfterWorktreeCleanup(t *testi
 		status     string
 		wantHealth string
 	}{
-		{name: "done", status: "done", wantHealth: "complete"},
-		{name: "failed", status: "failed", wantHealth: "complete"},
-		{name: "failed-with-reason", status: "failed: command exited", wantHealth: "complete"},
+		{name: "done", status: "done", wantHealth: "recycled"},
+		{name: "failed", status: "failed", wantHealth: "recycled"},
+		{name: "failed-with-reason", status: "failed: command exited", wantHealth: "recycled"},
 		{name: "in-progress", status: "in_progress", wantHealth: "orphaned"},
 	}
 	for _, test := range tests {
@@ -741,11 +741,11 @@ func TestCollectorClassifiesLifecycleValues(t *testing.T) {
 		wantHealth string
 	}{
 		{name: "in-progress", value: "in_progress", wantStatus: "in_progress", wantHealth: "active"},
-		{name: "needs-input", value: "needs_input", wantStatus: "needs_input", wantHealth: "active"},
-		{name: "blocked", value: "blocked", wantStatus: "blocked", wantHealth: "active"},
-		{name: "done", value: "done", wantStatus: "done", wantHealth: "complete"},
-		{name: "failed", value: "failed", wantStatus: "failed", wantHealth: "complete"},
-		{name: "failed-with-reason", value: "failed: command exited", wantStatus: "failed: command exited", wantHealth: "complete"},
+		{name: "needs-input", value: "needs_input", wantStatus: "needs_input", wantHealth: "attention"},
+		{name: "blocked", value: "blocked", wantStatus: "blocked", wantHealth: "attention"},
+		{name: "done", value: "done", wantStatus: "done", wantHealth: "recycled"},
+		{name: "failed", value: "failed", wantStatus: "failed", wantHealth: "recycled"},
+		{name: "failed-with-reason", value: "failed: command exited", wantStatus: "failed: command exited", wantHealth: "recycled"},
 		{name: "orphaned", value: "orphaned", wantStatus: "orphaned", wantHealth: "orphaned"},
 		{name: "empty", value: "", wantStatus: "unknown", wantHealth: "unknown"},
 		{name: "unknown", value: "credential=hunter2", wantStatus: "unknown", wantHealth: "unknown"},
@@ -756,7 +756,7 @@ func TestCollectorClassifiesLifecycleValues(t *testing.T) {
 		worker := filepath.Join(root, test.name, "api")
 		mustMkdirAll(t, worker)
 		writeFile(t, filepath.Join(worker, "status"), test.value+"\n")
-		if test.wantHealth == "active" {
+		if test.wantHealth == "active" || test.wantHealth == "attention" {
 			writeFile(t, filepath.Join(worker, "worktree"), worktree+"\n")
 		}
 		setModTime(t, filepath.Join(worker, "status"), now.Add(-time.Minute))
@@ -796,6 +796,146 @@ func TestCollectorToleratesMissingFleetRoot(t *testing.T) {
 	state := dashboard.Collector{FleetRoot: filepath.Join(t.TempDir(), "missing")}.Collect(t.Context())
 	if state.Workers == nil || len(state.Warnings) != 1 {
 		t.Fatalf("state = %#v, want empty workers and one warning", state)
+	}
+}
+
+func TestCollectorClassifiesBlockedAndNeedsInputAsAttention(t *testing.T) {
+	root := t.TempDir()
+	worktree := filepath.Join(root, "worktree")
+	mustMkdirAll(t, worktree)
+	now := time.Date(2026, 7, 26, 12, 0, 0, 0, time.UTC)
+	tests := []struct {
+		name       string
+		status     string
+		wantHealth string
+	}{
+		{name: "blocked", status: "blocked", wantHealth: "attention"},
+		{name: "needs-input", status: "needs_input", wantHealth: "attention"},
+		{name: "in-progress", status: "in_progress", wantHealth: "active"},
+	}
+	for _, test := range tests {
+		worker := filepath.Join(root, test.name, "api")
+		mustMkdirAll(t, worker)
+		writeFile(t, filepath.Join(worker, "status"), test.status+"\n")
+		writeFile(t, filepath.Join(worker, "worktree"), worktree+"\n")
+		setModTime(t, filepath.Join(worker, "status"), now.Add(-time.Minute))
+	}
+
+	state := dashboard.Collector{
+		FleetRoot:  root,
+		Now:        func() time.Time { return now },
+		StaleAfter: 15 * time.Minute,
+		Run:        func(context.Context, string, string, ...string) ([]byte, error) { return nil, nil },
+	}.Collect(t.Context())
+	byTask := make(map[string]dashboard.Worker, len(state.Workers))
+	for _, worker := range state.Workers {
+		byTask[worker.Task] = worker
+	}
+	for _, test := range tests {
+		if got := byTask[test.name].Health; got != test.wantHealth {
+			t.Errorf("%s health = %q, want %q", test.name, got, test.wantHealth)
+		}
+	}
+}
+
+func TestCollectorClassifiesTerminalRecordsWithAndWithoutWorktree(t *testing.T) {
+	root := t.TempDir()
+	worktree := filepath.Join(root, "present-worktree")
+	mustMkdirAll(t, worktree)
+	tests := []struct {
+		name       string
+		status     string
+		worktree   string
+		wantHealth string
+	}{
+		{name: "done-with-wt", status: "done", worktree: worktree, wantHealth: "complete"},
+		{name: "failed-with-wt", status: "failed", worktree: worktree, wantHealth: "complete"},
+		{name: "done-no-wt", status: "done", worktree: filepath.Join(root, "removed"), wantHealth: "recycled"},
+		{name: "failed-no-wt", status: "failed", worktree: filepath.Join(root, "removed"), wantHealth: "recycled"},
+		{name: "failed-reason-no-wt", status: "failed: reason", worktree: filepath.Join(root, "removed"), wantHealth: "recycled"},
+		{name: "done-no-wt-path", status: "done", worktree: "", wantHealth: "recycled"},
+	}
+	for _, test := range tests {
+		worker := filepath.Join(root, test.name, "api")
+		mustMkdirAll(t, worker)
+		writeFile(t, filepath.Join(worker, "status"), test.status+"\n")
+		if test.worktree != "" {
+			writeFile(t, filepath.Join(worker, "worktree"), test.worktree+"\n")
+		}
+	}
+
+	state := dashboard.Collector{
+		FleetRoot: root,
+		Run:       func(context.Context, string, string, ...string) ([]byte, error) { return nil, nil },
+	}.Collect(t.Context())
+	byTask := make(map[string]dashboard.Worker, len(state.Workers))
+	for _, worker := range state.Workers {
+		byTask[worker.Task] = worker
+	}
+	for _, test := range tests {
+		if got := byTask[test.name].Health; got != test.wantHealth {
+			t.Errorf("%s health = %q, want %q", test.name, got, test.wantHealth)
+		}
+	}
+}
+
+func TestCollectorUsesMultiFileEvidenceForStaleness(t *testing.T) {
+	root := t.TempDir()
+	worktree := filepath.Join(root, "worktree")
+	mustMkdirAll(t, worktree)
+	now := time.Date(2026, 7, 26, 12, 0, 0, 0, time.UTC)
+	staleAt := now.Add(-time.Hour)
+	freshAt := now.Add(-time.Minute)
+
+	type workerSpec struct {
+		name       string
+		statusAt   time.Time
+		logAt      time.Time
+		messageAt  time.Time
+		diagAt     time.Time
+		wantHealth string
+	}
+	tests := []workerSpec{
+		{name: "all-stale", statusAt: staleAt, wantHealth: "stale"},
+		{name: "fresh-log", statusAt: staleAt, logAt: freshAt, wantHealth: "active"},
+		{name: "fresh-message", statusAt: staleAt, messageAt: freshAt, wantHealth: "active"},
+		{name: "fresh-diagnostic", statusAt: staleAt, diagAt: freshAt, wantHealth: "active"},
+		{name: "all-fresh", statusAt: freshAt, logAt: freshAt, messageAt: freshAt, diagAt: freshAt, wantHealth: "active"},
+	}
+	for _, test := range tests {
+		worker := filepath.Join(root, test.name, "api")
+		mustMkdirAll(t, worker)
+		writeFile(t, filepath.Join(worker, "status"), "in_progress\n")
+		writeFile(t, filepath.Join(worker, "worktree"), worktree+"\n")
+		setModTime(t, filepath.Join(worker, "status"), test.statusAt)
+		if !test.logAt.IsZero() {
+			writeFile(t, filepath.Join(worker, "worker.log"), "log line\n")
+			setModTime(t, filepath.Join(worker, "worker.log"), test.logAt)
+		}
+		if !test.messageAt.IsZero() {
+			writeFile(t, filepath.Join(worker, "message"), "waiting\n")
+			setModTime(t, filepath.Join(worker, "message"), test.messageAt)
+		}
+		if !test.diagAt.IsZero() {
+			writeFile(t, filepath.Join(worker, "diagnostic"), "nominal\n")
+			setModTime(t, filepath.Join(worker, "diagnostic"), test.diagAt)
+		}
+	}
+
+	state := dashboard.Collector{
+		FleetRoot:  root,
+		Now:        func() time.Time { return now },
+		StaleAfter: 15 * time.Minute,
+		Run:        func(context.Context, string, string, ...string) ([]byte, error) { return nil, nil },
+	}.Collect(t.Context())
+	byTask := make(map[string]dashboard.Worker, len(state.Workers))
+	for _, worker := range state.Workers {
+		byTask[worker.Task] = worker
+	}
+	for _, test := range tests {
+		if got := byTask[test.name].Health; got != test.wantHealth {
+			t.Errorf("%s health = %q, want %q", test.name, got, test.wantHealth)
+		}
 	}
 }
 

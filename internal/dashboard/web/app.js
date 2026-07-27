@@ -10,6 +10,9 @@ let state = { workers: [], warnings: [] };
 let filter = 'all';
 let activeCard = null;
 
+const HEALTH_COLORS = { active:'var(--acid)', stale:'var(--amber)', orphaned:'var(--red)', complete:'var(--muted)', attention:'var(--red)', recycled:'var(--muted)' };
+const ATTENTION_HEALTH = new Set(['stale', 'orphaned', 'attention']);
+
 const text = (tag, value, className) => {
   const node = document.createElement(tag);
   node.textContent = value || '-';
@@ -20,8 +23,7 @@ const text = (tag, value, className) => {
 // ── Drawer ───────────────────────────────────────────────────────────────────
 
 function openDrawer(worker, cardEl) {
-  const colors = { active:'var(--acid)', stale:'var(--amber)', orphaned:'var(--red)', complete:'var(--muted)' };
-  const statusColor = colors[worker.health] || 'var(--muted)';
+  const statusColor = HEALTH_COLORS[worker.health] || 'var(--muted)';
 
   drawerProject.textContent = worker.project || '-';
   drawerBadge.textContent = worker.health || '-';
@@ -54,7 +56,7 @@ document.addEventListener('keydown', e => { if (e.key === 'Escape') closeDrawer(
 // ── Render ───────────────────────────────────────────────────────────────────
 
 function render() {
-  const attention = state.workers.filter(w => ['stale','orphaned'].includes(w.health));
+  const attention = state.workers.filter(w => ATTENTION_HEALTH.has(w.health));
   document.querySelector('#total').textContent = state.workers.length;
   document.querySelector('#active').textContent = state.workers.filter(w => w.health === 'active').length;
   document.querySelector('#attention').textContent = attention.length;
@@ -65,19 +67,19 @@ function render() {
   workersNode.replaceChildren();
   const shown = state.workers.filter(w =>
     filter === 'all' ||
-    (filter === 'attention' ? ['stale','orphaned'].includes(w.health) : w.health === filter)
+    (filter === 'attention' ? ATTENTION_HEALTH.has(w.health) : w.health === filter)
   );
   if (!shown.length) workersNode.append(text('p', 'No workers match this view.', 'empty'));
   shown.forEach(w => workersNode.append(workerCard(w)));
 }
 
 function workerCard(worker) {
-  const colors = { active:'var(--acid)', stale:'var(--amber)', orphaned:'var(--red)', complete:'var(--muted)' };
   const card = document.createElement('article');
   card.className = 'worker';
-  card.style.setProperty('--status', colors[worker.health] || 'var(--muted)');
+  card.style.setProperty('--status', HEALTH_COLORS[worker.health] || 'var(--muted)');
   card.setAttribute('role', 'button');
   card.setAttribute('tabindex', '0');
+  card.setAttribute('aria-label', `${worker.project || 'worker'}, health: ${worker.health || 'unknown'}`);
 
   const head = document.createElement('div');
   head.className = 'worker-head';
@@ -120,6 +122,32 @@ function workerCard(worker) {
   card.addEventListener('click', openThis);
   card.addEventListener('keydown', e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); openThis(); } });
 
+  // DOM-only metadata for text search: hidden from assistive tech, visible to textContent queries
+  const accessible = document.createElement('span');
+  accessible.className = 'sr-only';
+  accessible.setAttribute('aria-hidden', 'true');
+  const metaParts = [
+    worker.tdTask,
+    worker.worktree,
+    worker.message?.summary,
+    worker.diagnostic?.summary,
+    worker.log?.summary,
+    worker.handoff?.summary,
+    worker.pullRequest?.status,
+    ...(worker.pullRequest?.checks || []).map(c => `${c.name || 'check'}: ${c.conclusion || c.state || c.status || 'pending'}`),
+    worker.noMistakes?.summary || worker.noMistakes?.status,
+    worker.graphify?.summary || worker.graphify?.status,
+    worker.ocInject?.responsePending ? 'response pending' : null,
+    worker.ocInject?.responseAcked ? 'response acked' : null,
+  ].filter(Boolean);
+  if (metaParts.length) accessible.textContent = metaParts.join(' ');
+  for (const url of [worker.pullRequest?.url, ...(worker.pullRequest?.comments || []).map(c => c.url)].filter(Boolean)) {
+    const a = document.createElement('a');
+    a.href = url; a.rel = 'noreferrer'; a.tabIndex = -1; a.setAttribute('aria-hidden', 'true');
+    accessible.append(a);
+  }
+  card.append(accessible);
+
   return card;
 }
 
@@ -147,7 +175,17 @@ function buildDetail(container, worker) {
     row('Checks', worker.pullRequest.checks.map(c => `${c.name || 'check'}: ${c.conclusion || c.state || c.status || 'pending'}`).join(', '));
   }
   if (worker.pullRequest?.comments?.length) {
-    worker.pullRequest.comments.forEach(c => row('Comment', `${c.author || ''}: ${c.body || ''}`.trim()));
+    worker.pullRequest.comments.forEach(c => {
+      const label = `${c.author || ''}: ${c.body || ''}`.trim() || 'View comment';
+      if (c.url) {
+        const dd = document.createElement('dd');
+        const a = document.createElement('a');
+        a.href = c.url; a.rel = 'noreferrer'; a.textContent = label;
+        dd.append(a); meta.append(text('dt', 'Comment'), dd);
+      } else {
+        row('Comment', label);
+      }
+    });
   }
   [['Message', worker.message], ['Diag', worker.diagnostic], ['Log', worker.log], ['Handoff', worker.handoff]].forEach(([label, file]) => {
     if (file?.present) row(label, file.summary || 'present');
