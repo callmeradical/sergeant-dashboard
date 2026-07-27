@@ -589,6 +589,38 @@ func TestServeStatusBindsCanonicalHTTPSURL(t *testing.T) {
 	}
 }
 
+// Regression test for td-bd77c2: legacy GitHub status check context name must
+// survive the projection path and appear in the API response JSON.
+func TestStateAPIProjectsLegacyCheckContextName(t *testing.T) {
+	state := dashboard.State{
+		CollectedAt: time.Now(),
+		Workers: []dashboard.Worker{{
+			Task:   "task-1",
+			Project: "api",
+			Health: "active",
+			Status: "in_progress",
+			PullRequest: dashboard.PullRequest{
+				URL:    "https://github.com/acme/api/pull/1",
+				State:  "OPEN",
+				Status: "available",
+				Checks: []dashboard.Check{
+					{Context: "legacy-ci", State: "PENDING"},
+				},
+				Comments: []dashboard.Comment{},
+			},
+		}},
+		Warnings: []string{},
+	}
+	handler := dashboard.NewHandler(fixedSource{state: state})
+	resp := request(t, handler, http.MethodGet, "/sergeant/api/state")
+	if resp.Code != http.StatusOK {
+		t.Fatalf("state response = %d", resp.Code)
+	}
+	if !strings.Contains(resp.Body.String(), `"context":"legacy-ci"`) {
+		t.Fatalf("state response missing legacy check context field; body = %s", resp.Body.String())
+	}
+}
+
 func request(t *testing.T, handler http.Handler, method, path string) *httptest.ResponseRecorder {
 	t.Helper()
 	recorder := httptest.NewRecorder()

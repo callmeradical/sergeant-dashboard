@@ -156,7 +156,7 @@ function workerCard(worker) {
     worker.log?.summary,
     worker.handoff?.summary,
     worker.pullRequest?.status,
-    ...(worker.pullRequest?.checks || []).map(c => `${c.name || 'check'}: ${c.conclusion || c.state || c.status || 'pending'}`),
+    ...(worker.pullRequest?.checks || []).map(c => `${c.context || c.name || 'check'}: ${c.conclusion || c.state || c.status || 'pending'}`),
     worker.noMistakes?.summary || worker.noMistakes?.status,
     worker.graphify?.summary || worker.graphify?.status,
     worker.ocInject?.responsePending ? 'response pending' : null,
@@ -198,7 +198,7 @@ function buildDetail(container, worker) {
     row('PR', worker.pullRequest.status);
   }
   if (worker.pullRequest?.checks?.length) {
-    row('Checks', worker.pullRequest.checks.map(c => `${c.name || 'check'}: ${c.conclusion || c.state || c.status || 'pending'}`).join(', '));
+    row('Checks', worker.pullRequest.checks.map(c => `${c.context || c.name || 'check'}: ${c.conclusion || c.state || c.status || 'pending'}`).join(', '));
   }
   if (worker.pullRequest?.comments?.length) {
     worker.pullRequest.comments.forEach(c => {

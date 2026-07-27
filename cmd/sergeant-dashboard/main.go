@@ -27,7 +27,7 @@ func main() {
 		return
 	}
 	config := dashboard.ConfigFromEnv(os.Getenv)
-	collector := dashboard.Collector{FleetRoot: config.FleetRoot, StaleAfter: config.StaleAfter}
+	collector := dashboard.Collector{FleetRoot: config.FleetRoot, StaleAfter: config.StaleAfter, Limit: config.Limit}
 	server := &http.Server{
 		Addr:              config.Address,
 		Handler:           dashboard.NewHandler(collector),
