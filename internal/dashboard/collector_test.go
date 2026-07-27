@@ -1402,6 +1402,23 @@ func TestCollectorLimitGuardFiresBeforeReadingNextTask(t *testing.T) {
 	}
 }
 
+func TestCollectorLimitUsesDeterministicLexicalTaskOrder(t *testing.T) {
+	root := t.TempDir()
+	for i := 63; i >= 0; i-- {
+		worker := filepath.Join(root, fmt.Sprintf("task-%02d", i), "api")
+		mustMkdirAll(t, worker)
+		writeFile(t, filepath.Join(worker, "status"), "in_progress\n")
+	}
+
+	state := dashboard.Collector{FleetRoot: root, Limit: 1}.Collect(t.Context())
+	if len(state.Workers) != 1 {
+		t.Fatalf("workers = %d, want 1", len(state.Workers))
+	}
+	if state.Workers[0].Task != "task-00" {
+		t.Fatalf("limited worker = %q, want lexical first task task-00", state.Workers[0].Task)
+	}
+}
+
 // Regression test for td-bd77c2: Check must preserve statusCheckRollup.context
 // so legacy GitHub status checks retain their identifier.
 
