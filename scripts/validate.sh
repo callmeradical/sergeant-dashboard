@@ -22,8 +22,6 @@ if command -v jq >/dev/null 2>&1; then
       exit 1
     fi
 
-    total=$(printf '%s' "$state" | jq '.workers | length')
-    active=$(printf '%s' "$state" | jq '[.workers[] | select(.health=="active")] | length')
     invalid=$(printf '%s' "$state" | jq '[.workers[] | select(.health != "active" and .health != "orphaned")] | length')
 
     if [ "$invalid" -gt 0 ]; then
