@@ -15,7 +15,7 @@ go build ./cmd/sergeant-dashboard
 go run ./cmd/sergeant-dashboard
 ```
 
-The server always binds to `127.0.0.1:8992`. Open <http://127.0.0.1:8992/sergeant/>. The health endpoint is <http://127.0.0.1:8992/healthz>. Bounded summary JSON is available at <http://127.0.0.1:8992/sergeant/api/state>; the UI obtains one redacted worker detail at `/sergeant/api/workers/{task}/{repository}` only when its drawer opens.
+The server always binds to `127.0.0.1:8992`. Open <http://127.0.0.1:8992/sergeant/>. The health endpoint is <http://127.0.0.1:8992/healthz> and projected JSON is available at <http://127.0.0.1:8992/sergeant/api/state>. That API returns the operational worker set only: supervisor-verified live workers as `active` plus actionable non-terminal records as `orphaned`. Stale, complete, and malformed historical records stay out of the overview and are summarized in warnings instead. The UI obtains one redacted worker detail at `/sergeant/api/workers/{task}/{repository}` only when its drawer opens.
 
 The fleet root defaults to `$XDG_DATA_HOME/sergeant/fleet`, or `$HOME/.local/share/sergeant/fleet` when `XDG_DATA_HOME` is unset. The project registry defaults to `$HOME/.config/sergeant` and follows `SERGEANT_CONFIG`. `SERGEANT_FLEET_ROOT` can select a different read-only source, and `SERGEANT_STALE_AFTER` controls the default `30m` stale threshold.
 
@@ -52,6 +52,9 @@ Validate both user services, local health/UI, and the exact tailnet route after 
 ```sh
 ./scripts/validate.sh
 ```
+
+When `jq` is available and the API is reachable, the validator also checks that `/sergeant/api/state` returns a structurally valid operational-set response and leaks no `stale`, `complete`, or `unknown` workers. Set `SERGEANT_TAILNET_URL` to validate a different tailnet hostname. It must be a canonical HTTPS URL on port 443 with exactly the `/sergeant/` path and no userinfo, query, or fragment; the validator derives the Serve host and path from this one URL.
+
 
 ## Rollback
 

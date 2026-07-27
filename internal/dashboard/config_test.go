@@ -30,6 +30,36 @@ func TestConfigUsesLoopbackAndPortableDataHome(t *testing.T) {
 	}
 }
 
+// Regression tests for td-9782c5: Config must expose Limit so the production
+// binary can pass it to Collector and bound the fleet scan.
+
+func TestConfigReadsWorkerLimitFromEnv(t *testing.T) {
+	config := dashboard.ConfigFromEnv(func(key string) string {
+		if key == "HOME" {
+			return "/home/operator"
+		}
+		if key == "SERGEANT_WORKER_LIMIT" {
+			return "500"
+		}
+		return ""
+	})
+	if config.Limit != 500 {
+		t.Fatalf("worker limit = %d, want 500", config.Limit)
+	}
+}
+
+func TestConfigDefaultsWorkerLimitToZero(t *testing.T) {
+	config := dashboard.ConfigFromEnv(func(key string) string {
+		if key == "HOME" {
+			return "/home/operator"
+		}
+		return ""
+	})
+	if config.Limit != 0 {
+		t.Fatalf("default worker limit = %d, want 0 (unlimited)", config.Limit)
+	}
+}
+
 func TestConfigFallsBackForInvalidOptionalValues(t *testing.T) {
 	config := dashboard.ConfigFromEnv(func(key string) string {
 		if key == "HOME" {

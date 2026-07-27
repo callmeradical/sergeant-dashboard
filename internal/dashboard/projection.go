@@ -137,22 +137,61 @@ var (
 	secretValue      = regexp.MustCompile(`(?i)(bearer\s+)[^\s,;]+|((?:api[_-]?key|credential|password|secret|token)\s*[:=]\s*)[^\s,;]+|AKIA[A-Z0-9]{16}|gh[pousr]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,}|npm_[A-Za-z0-9]{20,}|sk-[A-Za-z0-9_-]{20,}|xox[baprs]-[A-Za-z0-9-]{20,}`)
 )
 
+// isOperational reports whether a worker is part of the operational set:
+// exact-supervisor-verified live workers (active) and actionable non-terminal
+// records (orphaned). Completed, stale historical, and unknown malformed
+// inventory are excluded from the overview and board.
+func isOperational(health string) bool {
+	return health == "active" || health == "orphaned"
+}
+
 func projectState(state State) projectedState {
-	workerCount := min(len(state.Workers), maxProjectedWorkers)
-	warnings := append([]string(nil), state.Warnings...)
-	if len(state.Workers) > workerCount {
-		warnings = append(warnings, "projection truncated at safety limit")
-	}
-	groups, highest := projectWarningGroups(warnings, false)
-	projected := projectedState{CollectedAt: state.CollectedAt, Workers: make([]projectedSummary, 0, workerCount), Warnings: groups, HighestSeverity: highest}
-	for _, worker := range state.Workers[:workerCount] {
-		detailKey := worker.fleetProject
-		if detailKey == "" {
-			detailKey = worker.Repository
+	// Pass 1: filter-before-truncate — scan all workers, count excluded health
+	// classes for diagnostics, then collect operational workers up to the safety
+	// limit. Active workers are never dropped behind stale/complete/unknown inventory.
+	var completeCount, staleCount, unknownCount int
+	truncatedWorkers := false
+	workers := make([]projectedSummary, 0)
+	for i := range state.Workers {
+		switch state.Workers[i].Health {
+		case "complete", "recycled":
+			completeCount++
+		case "stale":
+			staleCount++
+		case "unknown":
+			unknownCount++
+		default:
+			if isOperational(state.Workers[i].Health) {
+				if len(workers) >= maxProjectedWorkers {
+					truncatedWorkers = true
+					continue
+				}
+				w := &state.Workers[i]
+				detailKey := w.fleetProject
+				if detailKey == "" {
+					detailKey = w.Repository
+				}
+				workers = append(workers, projectedSummary{Task: RedactText(w.Task), Title: RedactText(w.Title), Project: RedactText(w.Project), Repository: RedactText(w.Repository), Status: RedactText(w.Status), Health: RedactText(w.Health), Agent: RedactText(w.Agent), TDTask: validTDTask(w.TDTask), PullRequestState: RedactText(w.PullRequest.State), DetailKey: RedactText(detailKey), UpdatedAt: w.UpdatedAt})
+			}
 		}
-		projected.Workers = append(projected.Workers, projectedSummary{Task: RedactText(worker.Task), Title: RedactText(worker.Title), Project: RedactText(worker.Project), Repository: RedactText(worker.Repository), Status: RedactText(worker.Status), Health: RedactText(worker.Health), Agent: RedactText(worker.Agent), TDTask: validTDTask(worker.TDTask), PullRequestState: RedactText(worker.PullRequest.State), DetailKey: RedactText(detailKey), UpdatedAt: worker.UpdatedAt})
 	}
-	return projected
+
+	// Diagnostic warnings for excluded inventory (truthful, not a sign of error).
+	allWarnings := append([]string(nil), state.Warnings...)
+	if completeCount > 0 {
+		allWarnings = append(allWarnings, fmt.Sprintf("%d completed worker(s) excluded from overview", completeCount))
+	}
+	if staleCount > 0 {
+		allWarnings = append(allWarnings, fmt.Sprintf("%d stale worker(s) excluded from overview", staleCount))
+	}
+	if unknownCount > 0 {
+		allWarnings = append(allWarnings, fmt.Sprintf("%d unknown worker(s) excluded from overview", unknownCount))
+	}
+	if truncatedWorkers {
+		allWarnings = append(allWarnings, "projection truncated at safety limit")
+	}
+	groups, highest := projectWarningGroups(allWarnings, false)
+	return projectedState{CollectedAt: state.CollectedAt, Workers: workers, Warnings: groups, HighestSeverity: highest}
 }
 
 func projectDiagnostics(warnings []string) projectedDiagnostics {
@@ -422,6 +461,58 @@ func isSensitiveKey(key string, includeEnvironment bool) bool {
 		}
 	}
 	return false
+}
+
+// operationalFile reads a file at an absolute path without root sandboxing.
+// Used during the main fleet scan where scanning is already done via os.ReadDir.
+func operationalFile(path string) FileMetadata {
+	file, err := os.Open(path)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			return FileMetadata{Present: true, Summary: "[content unavailable: unreadable]", Status: "unreadable"}
+		}
+		return FileMetadata{}
+	}
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil {
+		return FileMetadata{Present: true, Summary: "[content unavailable: unreadable]", Status: "unreadable"}
+	}
+	if !info.Mode().IsRegular() {
+		return FileMetadata{Present: true, UpdatedAt: info.ModTime().UTC(), Summary: "[content unavailable: corrupt]", Status: "corrupt"}
+	}
+	data, err := io.ReadAll(io.LimitReader(file, maxOperationalBytes+1))
+	if err != nil {
+		return FileMetadata{Present: true, UpdatedAt: info.ModTime().UTC(), Summary: "[content unavailable: unreadable]", Status: "unreadable"}
+	}
+	if len(data) > maxOperationalBytes {
+		return FileMetadata{Present: true, UpdatedAt: info.ModTime().UTC(), Summary: "[content unavailable: oversized]", Status: "oversized"}
+	}
+	summary := strings.TrimSpace(RedactText(string(data)))
+	if summary == "" {
+		return FileMetadata{Present: true, UpdatedAt: info.ModTime().UTC(), Summary: "[content unavailable: corrupt]", Status: "corrupt"}
+	}
+	return FileMetadata{Present: true, UpdatedAt: info.ModTime().UTC(), Summary: summary, Status: "available"}
+}
+
+// fileMetadata returns presence and mod-time metadata for a file at an absolute path.
+func fileMetadata(path string) FileMetadata {
+	info, err := os.Stat(path)
+	if err != nil || !info.Mode().IsRegular() {
+		return FileMetadata{}
+	}
+	return FileMetadata{Present: true, UpdatedAt: info.ModTime().UTC()}
+}
+
+// rootFileMetadata returns presence and mod-time metadata for a file
+// accessed through a root-sandboxed handle.
+func rootFileMetadata(root *os.Root, path string) FileMetadata {
+	file, info, err := openRootRegular(root, path)
+	if err != nil {
+		return FileMetadata{}
+	}
+	defer file.Close()
+	return FileMetadata{Present: true, UpdatedAt: info.ModTime().UTC()}
 }
 
 func rootOperationalFile(root *os.Root, path string) FileMetadata {

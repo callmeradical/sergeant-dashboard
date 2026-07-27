@@ -1,6 +1,7 @@
 package dashboard_test
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/base64"
@@ -26,8 +27,9 @@ type fixedSource struct{ state dashboard.State }
 func (source fixedSource) Collect(context.Context) dashboard.State { return source.state }
 
 type fixedDetailSource struct {
-	state  dashboard.State
-	worker dashboard.Worker
+	state   dashboard.State
+	worker  dashboard.Worker
+	workers []dashboard.Worker // optional: multi-worker detail lookup
 }
 
 type canceledDetailSource struct{ fixedSource }
@@ -39,6 +41,11 @@ func (source canceledDetailSource) CollectDetail(ctx context.Context, _, _ strin
 
 func (source fixedDetailSource) Collect(context.Context) dashboard.State { return source.state }
 func (source fixedDetailSource) CollectDetail(_ context.Context, task, repository string) (dashboard.Worker, bool) {
+	for _, w := range source.workers {
+		if task == w.Task && repository == w.Repository {
+			return w, true
+		}
+	}
 	return source.worker, task == source.worker.Task && repository == source.worker.Repository
 }
 
@@ -475,7 +482,7 @@ func TestUnavailableConfiguredIdentityStillOpensTruthfulDetail(t *testing.T) {
 	worker := filepath.Join(task, "opaque-repository")
 	mustMkdirAll(t, worker)
 	writeFile(t, filepath.Join(task, "brief.md"), "Project: missing-project\nBrief: Investigate worker\n")
-	writeFile(t, filepath.Join(worker, "status"), "done\n")
+	writeFile(t, filepath.Join(worker, "status"), "in_progress\n")
 	handler := dashboard.NewHandler(dashboard.Collector{FleetRoot: root, ConfigRoot: t.TempDir()})
 
 	summary := request(t, handler, http.MethodGet, "/sergeant/api/state")
@@ -512,6 +519,163 @@ func TestStateAPIProjectsBlockedLifecycleStatus(t *testing.T) {
 	}
 }
 
+// TestStateAPIFiltersBeforeTruncating verifies that operational-set filtering
+// happens before the maxProjectedWorkers safety truncation, so active workers
+// past position 1000 in a large fleet are not silently dropped.
+func TestStateAPIFiltersBeforeTruncating(t *testing.T) {
+	// Build a state with 1002 workers: 1000 stale followed by 2 active.
+	// If truncation precedes filtering the 2 active workers never appear.
+	workers := make([]dashboard.Worker, 1002)
+	for i := range 1000 {
+		workers[i] = dashboard.Worker{Task: fmt.Sprintf("stale-%04d", i), Health: "stale", Status: "in_progress"}
+	}
+	workers[1000] = dashboard.Worker{Task: "active-tail-0", Health: "active", Status: "in_progress"}
+	workers[1001] = dashboard.Worker{Task: "active-tail-1", Health: "active", Status: "in_progress"}
+
+	state := dashboard.State{Workers: workers, Warnings: []string{}}
+	response := request(t, dashboard.NewHandler(fixedSource{state: state}), http.MethodGet, "/sergeant/api/state")
+	if response.Code != http.StatusOK {
+		t.Fatalf("state response = %d", response.Code)
+	}
+	body := response.Body.String()
+	if !strings.Contains(body, `"task":"active-tail-0"`) || !strings.Contains(body, `"task":"active-tail-1"`) {
+		t.Errorf("active workers past position 1000 were dropped (truncated before filtered): %s", body[:min(200, len(body))])
+	}
+	if strings.Contains(body, `"health":"stale"`) {
+		t.Errorf("stale workers leaked into operational set: %s", body[:min(200, len(body))])
+	}
+}
+
+func TestStateAPIDoesNotWarnAtExactOperationalLimit(t *testing.T) {
+	workers := make([]dashboard.Worker, 1000)
+	for i := range workers {
+		workers[i] = dashboard.Worker{Task: fmt.Sprintf("active-%04d", i), Health: "active", Status: "in_progress"}
+	}
+
+	response := request(t, dashboard.NewHandler(fixedSource{state: dashboard.State{Workers: workers, Warnings: []string{}}}), http.MethodGet, "/sergeant/api/state")
+	if response.Code != http.StatusOK {
+		t.Fatalf("state response = %d", response.Code)
+	}
+	if strings.Contains(response.Body.String(), "projection truncated at safety limit") {
+		t.Fatalf("exact operational limit reported truncation: %s", response.Body.String())
+	}
+}
+
+// TestStateAPIProjectsOnlyOperationalWorkersFromMixedHistory reproduces the
+// 154-record live failure: the API should return only the operational set
+// (verified active workers and actionable orphaned records), not the full
+// retained fleet inventory.
+func TestStateAPIProjectsOnlyOperationalWorkersFromMixedHistory(t *testing.T) {
+	root := t.TempDir()
+	now := time.Date(2026, 7, 26, 12, 0, 0, 0, time.UTC)
+	staleAfter := 30 * time.Minute
+
+	mkWorker := func(task, project, status, pane string, worktree bool, age time.Duration) {
+		dir := filepath.Join(root, task, project)
+		mustMkdirAll(t, dir)
+		writeFile(t, filepath.Join(dir, "status"), status+"\n")
+		setModTime(t, filepath.Join(dir, "status"), now.Add(-age))
+		if pane != "" {
+			writeFile(t, filepath.Join(dir, "pane"), pane+"\n")
+		}
+		if worktree {
+			wt := filepath.Join(root, task+"-wt")
+			mustMkdirAll(t, wt)
+			writeFile(t, filepath.Join(dir, "worktree"), wt+"\n")
+		}
+	}
+
+	// 93 stale workers: in_progress, existing worktree, old status, dead/missing pane.
+	// Includes one explicit reused-pane (prefix-colliding with an active worker's pane).
+	mkWorker("stale-reused-pane", "api", "in_progress", "pane-live", true, staleAfter+time.Minute)
+	for i := 1; i < 93; i++ {
+		mkWorker(fmt.Sprintf("stale-%03d", i), "api", "in_progress", "", true, staleAfter+time.Minute)
+	}
+
+	// 1 active worker: in_progress, existing worktree, old status but LIVE pane.
+	mkWorker("active-live", "api", "in_progress", "pane-live", true, staleAfter+time.Minute)
+
+	// 43 complete workers: terminal status, worktree cleaned up.
+	for i := 0; i < 40; i++ {
+		mkWorker(fmt.Sprintf("complete-done-%03d", i), "api", "done", "", false, time.Hour)
+	}
+	for i := 0; i < 3; i++ {
+		mkWorker(fmt.Sprintf("complete-failed-%03d", i), "api", "failed: command error", "", false, time.Hour)
+	}
+
+	// 7 orphaned workers: non-terminal status, worktree missing.
+	for i := 0; i < 3; i++ {
+		mkWorker(fmt.Sprintf("orphaned-needs-input-%03d", i), "api", "needs_input", "", false, time.Hour)
+	}
+	for i := 0; i < 2; i++ {
+		mkWorker(fmt.Sprintf("orphaned-blocked-%03d", i), "api", "blocked", "", false, time.Hour)
+	}
+	for i := 0; i < 2; i++ {
+		mkWorker(fmt.Sprintf("orphaned-explicit-%03d", i), "api", "orphaned", "", false, time.Hour)
+	}
+
+	// 10 unknown workers: invalid/malformed status.
+	for i := 0; i < 10; i++ {
+		mkWorker(fmt.Sprintf("unknown-%03d", i), "api", "invalid-status", "", false, time.Hour)
+	}
+
+	// Total: 93 stale + 1 active + 43 complete + 7 orphaned + 10 unknown = 154 workers.
+
+	livePane := "pane-live"
+	collector := dashboard.Collector{
+		FleetRoot:  root,
+		Now:        func() time.Time { return now },
+		StaleAfter: staleAfter,
+		InspectSupervisor: func(_ context.Context, pane, stateDir string) (bool, error) {
+			// Only the worker whose stateDir ends in "active-live/api" has a live pane.
+			return pane == livePane && strings.HasSuffix(stateDir, "active-live/api"), nil
+		},
+	}
+
+	handler := dashboard.NewHandler(collector)
+	response := request(t, handler, http.MethodGet, "/sergeant/api/state")
+	if response.Code != http.StatusOK {
+		t.Fatalf("state response = %d %s", response.Code, response.Body.String())
+	}
+
+	var state struct {
+		Workers []struct {
+			Task   string `json:"task"`
+			Health string `json:"health"`
+		} `json:"workers"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &state); err != nil {
+		t.Fatalf("decode state: %v: %s", err, response.Body.String())
+	}
+
+	var active, orphaned int
+	for _, w := range state.Workers {
+		switch w.Health {
+		case "active":
+			active++
+		case "orphaned":
+			orphaned++
+		default:
+			t.Errorf("non-operational worker in response: task=%s health=%s", w.Task, w.Health)
+		}
+	}
+	if got := len(state.Workers); got != 8 {
+		t.Errorf("operational workers = %d, want 8 (1 active + 7 orphaned); got health dist active=%d orphaned=%d", got, active, orphaned)
+	}
+	if active != 1 {
+		t.Errorf("active workers = %d, want 1 (pane-verified live supervisor)", active)
+	}
+	if orphaned != 7 {
+		t.Errorf("orphaned workers = %d, want 7 (actionable non-terminal records)", orphaned)
+	}
+	// Stale-with-reused-pane must not be active: prefix-colliding pane does not verify identity.
+	for _, w := range state.Workers {
+		if w.Task == "stale-reused-pane" {
+			t.Errorf("stale worker with reused pane appeared in operational set with health=%s", w.Health)
+		}
+	}
+}
+
 func TestEmbeddedApplicationRendersBrowserBehavior(t *testing.T) {
 	state := dashboard.State{
 		CollectedAt: time.Date(2026, 7, 21, 12, 0, 0, 0, time.UTC),
@@ -531,11 +695,11 @@ func TestEmbeddedApplicationRendersBrowserBehavior(t *testing.T) {
 				NoMistakes: dashboard.ToolStatus{Available: true, Phase: "review", Summary: "review passed"}, Graphify: dashboard.FileMetadata{Present: true, Summary: "Collector connects fleet state"},
 				OCInject: dashboard.AuditMetadata{ResponsePending: true},
 			},
-			{Task: "stale-task", Title: "Investigate queue", Project: "operator-suite", Repository: "worker", Status: "blocked", Health: "stale", TDTask: "invalid task", NoMistakes: dashboard.ToolStatus{Status: "unavailable"}, Graphify: dashboard.FileMetadata{Status: "missing"}},
+			{Task: "orphaned-task", Title: "Investigate queue", Project: "orphaned-project", Repository: "orphaned-repo", Status: "blocked", Health: "orphaned", TDTask: "invalid task", NoMistakes: dashboard.ToolStatus{Status: "unavailable"}, Graphify: dashboard.FileMetadata{Status: "missing"}},
 		},
 		Warnings: []string{"summary probe failed", "source delayed token=secret"},
 	}
-	valid := dashboard.NewHandler(fixedDetailSource{state: state, worker: state.Workers[0]})
+	valid := dashboard.NewHandler(fixedDetailSource{state: state, worker: state.Workers[0], workers: state.Workers})
 	empty := dashboard.NewHandler(fixedSource{state: dashboard.State{Workers: []dashboard.Worker{}, Warnings: []string{}}})
 	assets := dashboard.NewHandler(fixedSource{})
 	malformed := http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
@@ -553,7 +717,7 @@ func TestEmbeddedApplicationRendersBrowserBehavior(t *testing.T) {
 	}
 	fixtures := make(map[string]browserResponse)
 	for prefix, handler := range map[string]http.Handler{"/valid": valid, "/empty": empty, "/malformed": malformed} {
-		for _, path := range []string{"/sergeant/", "/sergeant/app.css", "/sergeant/app.js", "/sergeant/api/state", "/sergeant/api/diagnostics", "/sergeant/api/workers/raw-private-task/dashboard"} {
+		for _, path := range []string{"/sergeant/", "/sergeant/app.css", "/sergeant/app.js", "/sergeant/api/state", "/sergeant/api/diagnostics", "/sergeant/api/workers/raw-private-task/dashboard", "/sergeant/api/workers/orphaned-task/orphaned-repo"} {
 			response := request(t, handler, http.MethodGet, path)
 			fixtures[prefix+path] = browserResponse{Status: response.Code, Headers: response.Header(), Body: base64.StdEncoding.EncodeToString(response.Body.Bytes())}
 		}
@@ -575,14 +739,97 @@ func TestEmbeddedApplicationRendersBrowserBehavior(t *testing.T) {
 		t.Fatal("Chrome or Chromium is required for frontend behavior tests")
 	}
 
-	command := exec.Command("node", "testdata/frontend_test.mjs")
-	fixturePath := filepath.Join(t.TempDir(), "frontend-fixtures.json")
-	if err := os.WriteFile(fixturePath, fixtureJSON, 0o600); err != nil {
+	// Write fixtures to a temp file to avoid exceeding exec env var size limits.
+	fixtureFile := filepath.Join(t.TempDir(), "fixtures.json.b64")
+	if err := os.WriteFile(fixtureFile, []byte(base64.StdEncoding.EncodeToString(fixtureJSON)), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	command.Env = append(os.Environ(), "CHROME_BIN="+browser, "FRONTEND_FIXTURES_FILE="+fixturePath)
+
+	command := exec.Command("node", "testdata/frontend_test.mjs")
+	command.Env = append(os.Environ(), "CHROME_BIN="+browser, "FRONTEND_FIXTURES_FILE="+fixtureFile)
 	if output, err := command.CombinedOutput(); err != nil {
 		t.Fatalf("frontend behavior: %v: %s", err, output)
+	}
+}
+
+func TestServeStatusRejectsMalformedAndTrailingInput(t *testing.T) {
+	for name, input := range map[string]string{
+		"malformed": `{"Web":`,
+		"trailing":  `{"Web":{"host:443":{"Handlers":{"/sergeant":{"Proxy":"http://127.0.0.1:8992/sergeant"}}}}} {"injected":"credential"}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			if err := dashboard.ValidateServeStatus(bytes.NewBufferString(input), "cleanthes.taila4fb6a.ts.net:443", "/sergeant", "http://127.0.0.1:8992/sergeant"); err == nil {
+				t.Fatalf("ValidateServeStatus accepted %s input", name)
+			}
+		})
+	}
+}
+
+func TestServeStatusRequiresExpectedHTTPSHost(t *testing.T) {
+	input := `{"Web":{"other-host:443":{"Handlers":{"/sergeant":{"Proxy":"http://127.0.0.1:8992/sergeant"}}}}}`
+	if err := dashboard.ValidateServeStatus(bytes.NewBufferString(input), "cleanthes.taila4fb6a.ts.net:443", "/sergeant", "http://127.0.0.1:8992/sergeant"); err == nil {
+		t.Fatal("ValidateServeStatus accepted a route on an unrelated HTTPS host")
+	}
+}
+
+func TestServeStatusBindsCanonicalHTTPSURL(t *testing.T) {
+	serveStatus := `{"Web":{"cleanthes.taila4fb6a.ts.net:443":{"Handlers":{"/sergeant":{"Proxy":"http://127.0.0.1:8992/sergeant"}}}}}`
+	tests := []struct {
+		name    string
+		url     string
+		wantErr bool
+	}{
+		{name: "approved", url: "https://cleanthes.taila4fb6a.ts.net/sergeant/"},
+		{name: "http", url: "http://cleanthes.taila4fb6a.ts.net/sergeant/", wantErr: true},
+		{name: "wrong-host", url: "https://other-host.ts.net/sergeant/", wantErr: true},
+		{name: "wrong-port", url: "https://cleanthes.taila4fb6a.ts.net:8443/sergeant/", wantErr: true},
+		{name: "userinfo", url: "https://user@cleanthes.taila4fb6a.ts.net/sergeant/", wantErr: true},
+		{name: "query", url: "https://cleanthes.taila4fb6a.ts.net/sergeant/?token=secret", wantErr: true},
+		{name: "fragment", url: "https://cleanthes.taila4fb6a.ts.net/sergeant/#secret", wantErr: true},
+		{name: "wrong-path", url: "https://cleanthes.taila4fb6a.ts.net/other/", wantErr: true},
+		{name: "malformed", url: "://not-a-url", wantErr: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			err := dashboard.ValidateServeURL(bytes.NewBufferString(serveStatus), test.url, "http://127.0.0.1:8992/sergeant")
+			if (err != nil) != test.wantErr {
+				t.Fatalf("ValidateServeURL(%q) error = %v, want error %t", test.url, err, test.wantErr)
+			}
+		})
+	}
+}
+
+// Regression test for td-bd77c2: legacy GitHub status check context name must
+// survive the projection path and appear in the worker detail API response JSON.
+func TestStateAPIProjectsLegacyCheckContextName(t *testing.T) {
+	worker := dashboard.Worker{
+		Task:       "task-1",
+		Project:    "api",
+		Repository: "api",
+		Health:     "active",
+		Status:     "in_progress",
+		PullRequest: dashboard.PullRequest{
+			URL:    "https://github.com/acme/api/pull/1",
+			State:  "OPEN",
+			Status: "available",
+			Checks: []dashboard.Check{
+				{Context: "legacy-ci", State: "PENDING"},
+			},
+			Comments: []dashboard.Comment{},
+		},
+	}
+	state := dashboard.State{
+		CollectedAt: time.Now(),
+		Workers:     []dashboard.Worker{worker},
+		Warnings:    []string{},
+	}
+	handler := dashboard.NewHandler(fixedDetailSource{state: state, worker: worker})
+	resp := request(t, handler, http.MethodGet, "/sergeant/api/workers/task-1/api")
+	if resp.Code != http.StatusOK {
+		t.Fatalf("detail response = %d", resp.Code)
+	}
+	if !strings.Contains(resp.Body.String(), `"context":"legacy-ci"`) {
+		t.Fatalf("detail response missing legacy check context field; body = %s", resp.Body.String())
 	}
 }
 

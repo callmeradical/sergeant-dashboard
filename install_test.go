@@ -274,6 +274,125 @@ func TestValidationRequiresDashboardAndTailnetProxyServicesAndExactRoute(t *test
 	}
 }
 
+func TestValidationRejectsNonArrayWorkersPayload(t *testing.T) {
+	jqPath, err := exec.LookPath("jq")
+	if err != nil {
+		t.Skip("jq not installed")
+	}
+
+	home := t.TempDir()
+	binDir := filepath.Join(home, ".local", "bin")
+	mocks := filepath.Join(t.TempDir(), "bin")
+	mustMkdir(t, binDir)
+	mustMkdir(t, mocks)
+	writeExecutable(t, filepath.Join(mocks, "systemctl"), "#!/bin/sh\nexit 0\n")
+	writeExecutable(t, filepath.Join(mocks, "curl"), `#!/bin/sh
+case "$*" in
+  *"http://127.0.0.1:8992/sergeant/api/state"*) printf '%s' "$SERGEANT_STATE" ;;
+  *) printf '<title>Sergeant | Fleet command</title>\n' ;;
+esac
+`)
+	writeExecutable(t, filepath.Join(mocks, "jq"), "#!/bin/sh\nexec "+jqPath+" \"$@\"\n")
+	writeExecutable(t, filepath.Join(mocks, "tailscale"), "#!/bin/sh\nprintf '100.64.0.1\\n'\n")
+
+	build := exec.Command("go", "build", "-o", filepath.Join(binDir, "sergeant-dashboard"), "./cmd/sergeant-dashboard")
+	if output, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("build validator: %v: %s", err, output)
+	}
+
+	command := exec.Command("sh", "scripts/validate.sh")
+	command.Env = append(os.Environ(),
+		"HOME="+home,
+		"PATH="+mocks+":/usr/bin:/bin",
+		"SERGEANT_STATE={\"workers\":{}}",
+	)
+	output, err := command.CombinedOutput()
+	if err == nil || !strings.Contains(string(output), ".workers must be an array") {
+		t.Fatalf("validation accepted non-array workers payload: err=%v output=%s", err, output)
+	}
+}
+
+func TestValidationReportsPassedAPICheckWhenStructuralValidationRuns(t *testing.T) {
+	jqPath, err := exec.LookPath("jq")
+	if err != nil {
+		t.Skip("jq not installed")
+	}
+
+	home := t.TempDir()
+	binDir := filepath.Join(home, ".local", "bin")
+	mocks := filepath.Join(t.TempDir(), "bin")
+	mustMkdir(t, binDir)
+	mustMkdir(t, mocks)
+	writeExecutable(t, filepath.Join(mocks, "systemctl"), "#!/bin/sh\nexit 0\n")
+	writeExecutable(t, filepath.Join(mocks, "curl"), `#!/bin/sh
+case "$*" in
+  *"http://127.0.0.1:8992/sergeant/api/state"*) printf '%s' "$SERGEANT_STATE" ;;
+  *) printf '<title>Sergeant | Fleet command</title>\n' ;;
+esac
+`)
+	writeExecutable(t, filepath.Join(mocks, "jq"), "#!/bin/sh\nexec "+jqPath+" \"$@\"\n")
+	writeExecutable(t, filepath.Join(mocks, "tailscale"), "#!/bin/sh\nprintf '100.64.0.1\\n'\n")
+
+	build := exec.Command("go", "build", "-o", filepath.Join(binDir, "sergeant-dashboard"), "./cmd/sergeant-dashboard")
+	if output, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("build validator: %v: %s", err, output)
+	}
+
+	command := exec.Command("sh", "scripts/validate.sh")
+	command.Env = append(os.Environ(),
+		"HOME="+home,
+		"PATH="+mocks+":/usr/bin:/bin",
+		"SERGEANT_STATE={\"workers\":[{\"health\":\"active\"},{\"health\":\"orphaned\"}]}",
+	)
+	output, err := command.CombinedOutput()
+	if err != nil {
+		t.Fatalf("validation rejected valid structural payload: %v: %s", err, output)
+	}
+	if !strings.Contains(string(output), "API state check passed") {
+		t.Fatalf("validation did not report successful API state check: %s", output)
+	}
+	if strings.Contains(string(output), "API state check skipped") {
+		t.Fatalf("validation incorrectly reported skipped API state check: %s", output)
+	}
+}
+
+func TestValidationReportsSkippedAPICheckWithoutJQ(t *testing.T) {
+	home := t.TempDir()
+	binDir := filepath.Join(home, ".local", "bin")
+	mocks := filepath.Join(t.TempDir(), "bin")
+	mustMkdir(t, binDir)
+	mustMkdir(t, mocks)
+	grepPath, err := exec.LookPath("grep")
+	if err != nil {
+		t.Skip("grep not installed")
+	}
+	writeExecutable(t, filepath.Join(mocks, "systemctl"), "#!/bin/sh\nexit 0\n")
+	writeExecutable(t, filepath.Join(mocks, "curl"), "#!/bin/sh\nprintf '<title>Sergeant | Fleet command</title>\\n'\n")
+	writeExecutable(t, filepath.Join(mocks, "tailscale"), "#!/bin/sh\nprintf '100.64.0.1\\n'\n")
+	writeExecutable(t, filepath.Join(mocks, "grep"), "#!/bin/sh\nexec "+grepPath+" \"$@\"\n")
+
+	build := exec.Command("go", "build", "-o", filepath.Join(binDir, "sergeant-dashboard"), "./cmd/sergeant-dashboard")
+	if output, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("build validator: %v: %s", err, output)
+	}
+
+	command := exec.Command("sh", "scripts/validate.sh")
+	command.Env = append(os.Environ(),
+		"HOME="+home,
+		"PATH="+mocks,
+	)
+	output, err := command.CombinedOutput()
+	if err != nil {
+		t.Fatalf("validation failed without jq: %v: %s", err, output)
+	}
+	if !strings.Contains(string(output), "API state check skipped (jq unavailable or API unreachable)") {
+		t.Fatalf("validation did not report skipped API state check: %s", output)
+	}
+	if strings.Contains(string(output), "API state check passed") {
+		t.Fatalf("validation incorrectly reported successful API state check: %s", output)
+	}
+}
+
 func runScript(t *testing.T, env []string, path string) {
 	t.Helper()
 	command := exec.Command("sh", path)

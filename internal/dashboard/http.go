@@ -1,13 +1,16 @@
 package dashboard
 
 import (
+	"compress/gzip"
 	"context"
 	"embed"
 	"encoding/json"
+	"io"
 	"io/fs"
 	"net/http"
 	"strings"
 	"sync"
+	"time"
 )
 
 type Source interface {
@@ -45,11 +48,48 @@ type coalescingSource struct {
 	active *collectionCall
 }
 
+// ttlCache wraps a coalescingSource and serves a cached result for up to ttl.
+type ttlCache struct {
+	source    *coalescingSource
+	ttl       time.Duration
+	mu        sync.Mutex
+	cached    projectedState
+	cachedAt  time.Time
+	hasCached bool
+}
+
+func (c *ttlCache) get(ctx context.Context) (projectedState, bool) {
+	c.mu.Lock()
+	if c.hasCached && time.Since(c.cachedAt) < c.ttl {
+		result := c.cached
+		c.mu.Unlock()
+		return result, true
+	}
+	c.mu.Unlock()
+
+	state, ok := c.source.Collect(ctx)
+	if !ok {
+		return projectedState{}, false
+	}
+	projected := projectState(state)
+
+	c.mu.Lock()
+	c.cached = projected
+	c.cachedAt = time.Now()
+	c.hasCached = true
+	c.mu.Unlock()
+
+	return projected, true
+}
+
 //go:embed web/*
 var webAssets embed.FS
 
 func NewHandler(source Source) http.Handler {
 	sharedSource := &coalescingSource{source: summarySource{Source: source}}
+	cache := &ttlCache{source: sharedSource, ttl: 3 * time.Second}
+
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", getOnly(func(writer http.ResponseWriter, _ *http.Request) {
 		writeJSON(writer, map[string]string{"status": "ok"})
@@ -58,12 +98,12 @@ func NewHandler(source Source) http.Handler {
 		writer.Header().Set("Cache-Control", "no-store")
 		ctx, cancel := context.WithTimeout(request.Context(), maxEnrichmentTime)
 		defer cancel()
-		state, ok := sharedSource.Collect(ctx)
+		projected, ok := cache.get(ctx)
 		if !ok || ctx.Err() != nil {
 			writeJSONStatus(writer, http.StatusServiceUnavailable, map[string]string{"error": "fleet state temporarily unavailable"})
 			return
 		}
-		writeJSON(writer, projectState(state))
+		writeJSON(writer, projected)
 	}))
 	mux.HandleFunc("/sergeant/api/diagnostics", getOnly(func(writer http.ResponseWriter, request *http.Request) {
 		writer.Header().Set("Cache-Control", "no-store")
@@ -109,7 +149,35 @@ func NewHandler(source Source) http.Handler {
 		panic(err)
 	}
 	mux.Handle("/sergeant/", getOnly(http.StripPrefix("/sergeant/", http.FileServer(http.FS(assets))).ServeHTTP))
-	return securityHeaders(mux)
+	return securityHeaders(gzipMiddleware(mux))
+}
+
+// gzipMiddleware compresses responses for clients that accept gzip.
+func gzipMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.Contains(r.Header.Get("Accept-Encoding"), "gzip") {
+			next.ServeHTTP(w, r)
+			return
+		}
+		gz, err := gzip.NewWriterLevel(w, gzip.BestSpeed)
+		if err != nil {
+			next.ServeHTTP(w, r)
+			return
+		}
+		defer gz.Close()
+		w.Header().Set("Content-Encoding", "gzip")
+		w.Header().Del("Content-Length")
+		next.ServeHTTP(&gzipResponseWriter{ResponseWriter: w, Writer: gz}, r)
+	})
+}
+
+type gzipResponseWriter struct {
+	http.ResponseWriter
+	Writer io.Writer
+}
+
+func (g *gzipResponseWriter) Write(b []byte) (int, error) {
+	return g.Writer.Write(b)
 }
 
 func (source *coalescingSource) Collect(ctx context.Context) (State, bool) {

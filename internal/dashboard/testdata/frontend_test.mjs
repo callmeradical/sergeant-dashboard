@@ -8,7 +8,11 @@ import { createServer } from 'node:net';
 import { request } from 'node:http';
 
 const browser = process.env.CHROME_BIN;
-const fixtures = JSON.parse(await readFile(process.env.FRONTEND_FIXTURES_FILE, 'utf8'));
+// Fixtures are written to a file to avoid exec env var size limits.
+const fixtureData = process.env.FRONTEND_FIXTURES_FILE
+  ? await readFile(process.env.FRONTEND_FIXTURES_FILE, 'utf8')
+  : process.env.FRONTEND_FIXTURES;
+const fixtures = JSON.parse(Buffer.from(fixtureData, 'base64'));
 
 const delay = milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds));
 
@@ -98,6 +102,8 @@ async function openPage(target, viewport) {
     const api = Buffer.from(fixtures[`${prefix}/sergeant/api/state`].body, 'base64').toString();
     const detailFixture = fixtures[`${prefix}/sergeant/api/workers/raw-private-task/dashboard`];
     const detail = detailFixture?.status === 200 ? Buffer.from(detailFixture.body, 'base64').toString() : '{}';
+    const detail2Fixture = fixtures[`${prefix}/sergeant/api/workers/orphaned-task/orphaned-repo`];
+    const detail2 = detail2Fixture?.status === 200 ? Buffer.from(detail2Fixture.body, 'base64').toString() : '{}';
     const diagnosticsFixture = fixtures[`${prefix}/sergeant/api/diagnostics`];
     const diagnostics = diagnosticsFixture?.status === 200 ? Buffer.from(diagnosticsFixture.body, 'base64').toString() : '{}';
     const policy = fixtures[`${prefix}/sergeant/`].headers['Content-Security-Policy'][0];
@@ -112,7 +118,7 @@ async function openPage(target, viewport) {
     ]);
     const fetchSetup = target === 'malformed'
       ? `window.fetches=[]; window.fetch = url => { window.fetches.push(String(url)); return Promise.resolve({ ok: true, json: () => Promise.reject(new Error('malformed state')) }); }`
-      : `window.fetches=[]; window.fetch = url => { window.fetches.push(String(url)); const path = String(url); const body = path.includes('api/workers/') ? ${detail} : path.includes('api/diagnostics') ? ${diagnostics} : ${api}; return Promise.resolve({ ok: true, json: () => Promise.resolve(body) }); }`;
+      : `window.fetches=[]; window.fetch = url => { window.fetches.push(String(url)); const path = String(url); const body = path.includes('api/workers/orphaned-task') ? ${detail2} : path.includes('api/workers/') ? ${detail} : path.includes('api/diagnostics') ? ${diagnostics} : ${api}; return Promise.resolve({ ok: true, json: () => Promise.resolve(body) }); }`;
     await command('Page.addScriptToEvaluateOnNewDocument', { source: fetchSetup });
     await command('Page.navigate', { url: pathToFileURL(join(fixtureDirectory, 'index.html')).href });
     for (let attempt = 0; attempt < 100; attempt++) {
@@ -207,6 +213,30 @@ for (const viewport of ['1280,900', '390,844', '390,320']) {
   assert.equal(rendered.toolbarDirection, viewport.startsWith('390') ? 'column' : 'row');
 }
 
+// Verify drawer content by clicking worker cards.
+const drawerPage = await openPage('valid', '1280,900');
+try {
+  // Click first card (active worker) and verify drawer detail.
+  await drawerPage.evaluate(`document.querySelectorAll('.worker')[0].click()`);
+  await delay(100);
+  const firstDrawer = await drawerPage.evaluate(`document.querySelector('#drawer-content').textContent`);
+  for (const expected of ['/secret/worktree', 'td-123', 'approval needed', 'worker recovered', 'tests passed', 'remaining: open PR', 'private check name.*SUCCESS', 'available truncated', 'review passed', 'Collector connects fleet state', 'response pending']) {
+    assert.match(firstDrawer, new RegExp(expected), `first drawer missing: ${expected}`);
+  }
+  // Verify PR and comment links are rendered in the drawer.
+  const drawerLinks = await drawerPage.evaluate(`[...document.querySelectorAll('#drawer-content a')].map(a => a.href)`);
+  assert.deepEqual(drawerLinks, ['https://github.com/acme/widget/pull/7', 'https://github.com/acme/widget/pull/7#issuecomment-1']);
+  // Click second card (orphaned worker) and verify its drawer detail.
+  await drawerPage.evaluate(`document.querySelectorAll('.worker')[1].click()`);
+  await delay(100);
+  const secondDrawer = await drawerPage.evaluate(`document.querySelector('#drawer-content').textContent`);
+  for (const expected of ['unavailable', 'missing']) {
+    assert.match(secondDrawer, new RegExp(expected), `second drawer missing: ${expected}`);
+  }
+} finally {
+  await drawerPage.close();
+}
+
 const filteredPage = await openPage('valid', '1280,900');
 try {
   const filtered = await filteredPage.evaluate(`(() => {
@@ -214,7 +244,7 @@ try {
     return { cards: document.querySelectorAll('.worker').length, text: document.querySelector('#workers').textContent };
   })()`);
   assert.equal(filtered.cards, 1);
-  assert.match(filtered.text, /stale/);
+  assert.match(filtered.text, /orphaned/);
   assert.doesNotMatch(filtered.text, /in_progress/);
 } finally {
   await filteredPage.close();

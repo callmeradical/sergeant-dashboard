@@ -148,7 +148,7 @@ function detailView(worker) {
   [['Log', worker.log], ['Handoff', worker.handoff]].forEach(([label, file]) => {
     if (file?.present || file?.status) addRow(timelineRows, label, file.summary || file.status || 'present');
   });
-  if (worker.pullRequest?.comments?.length) addRow(timelineRows, 'Comments', worker.pullRequest.comments.map(comment => `${comment.author || 'comment'}: ${comment.body || '-'}`).join('\n'));
+
   fragment.append(timeline);
 
   const [delivery, deliveryRows] = detailSection('Delivery');
@@ -163,6 +163,22 @@ function detailView(worker) {
   }
   addRow(deliveryRows, 'PR source', worker.pullRequest?.status);
   if (worker.pullRequest?.checks?.length) addRow(deliveryRows, 'Checks', worker.pullRequest.checks.map(check => `${check.name || check.context || 'check'}${check.context && check.name ? ` (${check.context})` : ''}: ${check.conclusion || check.state || check.status || 'pending'}`).join(', '));
+  if (worker.pullRequest?.comments?.length) {
+    worker.pullRequest.comments.forEach(comment => {
+      const label = `${comment.author || ''}: ${comment.body || ''}`.trim() || 'View comment';
+      if (comment.url) {
+        const dd = document.createElement('dd');
+        const a = document.createElement('a');
+        a.href = comment.url;
+        a.rel = 'noreferrer';
+        a.textContent = label;
+        dd.append(a);
+        deliveryRows.append(text('dt', 'Comment'), dd);
+      } else {
+        addRow(deliveryRows, 'Comment', label);
+      }
+    });
+  }
   if (worker.noMistakes?.available || worker.noMistakes?.status) addRow(deliveryRows, 'no-mistakes', worker.noMistakes.summary || worker.noMistakes.status || worker.noMistakes.phase);
   if (worker.graphify?.present || worker.graphify?.status) addRow(deliveryRows, 'Graphify', worker.graphify.summary || worker.graphify.status || 'present');
   if (worker.ocInject?.responsePending) addRow(deliveryRows, 'oc-inject', 'response pending');
