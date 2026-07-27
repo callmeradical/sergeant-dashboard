@@ -15,13 +15,18 @@ curl --fail --silent --show-error "$tailnet_url" >/dev/null
 # Requires jq. Only asserts when the API is reachable.
 if command -v jq >/dev/null 2>&1; then
   state=$(curl --fail --silent http://127.0.0.1:8992/sergeant/api/state 2>/dev/null) || state=''
-  if printf '%s' "$state" | jq -e '.workers' >/dev/null 2>&1; then
+  if [ -n "$state" ]; then
+    if ! printf '%s' "$state" | jq -e '.workers | type == "array"' >/dev/null 2>&1; then
+      printf 'API state check FAILED: .workers must be an array\n' >&2
+      exit 1
+    fi
+
     total=$(printf '%s' "$state" | jq '.workers | length')
     active=$(printf '%s' "$state" | jq '[.workers[] | select(.health=="active")] | length')
-    leaked=$(printf '%s' "$state" | jq '[.workers[] | select(.health == "stale" or .health == "complete" or .health == "unknown")] | length')
+    invalid=$(printf '%s' "$state" | jq '[.workers[] | select(.health != "active" and .health != "orphaned")] | length')
 
-    if [ "$leaked" -gt 0 ]; then
-      printf 'API state check FAILED: %s non-operational worker(s) (stale/complete/unknown) leaked into response\n' "$leaked" >&2
+    if [ "$invalid" -gt 0 ]; then
+      printf 'API state check FAILED: %s non-operational worker(s) leaked into response\n' "$invalid" >&2
       exit 1
     fi
 

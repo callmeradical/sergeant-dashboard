@@ -272,6 +272,45 @@ func TestValidationRequiresServePathAndBackendAssociation(t *testing.T) {
 	}
 }
 
+func TestValidationRejectsNonArrayWorkersPayload(t *testing.T) {
+	jqPath, err := exec.LookPath("jq")
+	if err != nil {
+		t.Skip("jq not installed")
+	}
+
+	home := t.TempDir()
+	binDir := filepath.Join(home, ".local", "bin")
+	mocks := filepath.Join(t.TempDir(), "bin")
+	mustMkdir(t, binDir)
+	mustMkdir(t, mocks)
+	writeExecutable(t, filepath.Join(mocks, "curl"), `#!/bin/sh
+case "$*" in
+  *"http://127.0.0.1:8992/sergeant/api/state"*) printf '%s' "$SERGEANT_STATE" ;;
+  *) exit 0 ;;
+esac
+`)
+	writeExecutable(t, filepath.Join(mocks, "jq"), "#!/bin/sh\nexec "+jqPath+" \"$@\"\n")
+	writeExecutable(t, filepath.Join(mocks, "tailscale"), "#!/bin/sh\nprintf '%s\\n' \"$TAILSCALE_STATUS\"\n")
+
+	build := exec.Command("go", "build", "-o", filepath.Join(binDir, "sergeant-dashboard"), "./cmd/sergeant-dashboard")
+	if output, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("build validator: %v: %s", err, output)
+	}
+
+	associated := `{"Web":{"cleanthes.taila4fb6a.ts.net:443":{"Handlers":{"/sergeant":{"Proxy":"http://127.0.0.1:8992/sergeant"}}}}}`
+	command := exec.Command("sh", "scripts/validate.sh")
+	command.Env = append(os.Environ(),
+		"HOME="+home,
+		"PATH="+mocks+":/usr/bin:/bin",
+		"TAILSCALE_STATUS="+associated,
+		"SERGEANT_STATE={\"workers\":{}}",
+	)
+	output, err := command.CombinedOutput()
+	if err == nil || !strings.Contains(string(output), ".workers must be an array") {
+		t.Fatalf("validation accepted non-array workers payload: err=%v output=%s", err, output)
+	}
+}
+
 func runScript(t *testing.T, env []string, path string) {
 	t.Helper()
 	command := exec.Command("sh", path)

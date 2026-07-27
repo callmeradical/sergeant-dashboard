@@ -1077,6 +1077,74 @@ func TestCollectorUsesMultiFileEvidenceForStaleness(t *testing.T) {
 	}
 }
 
+func TestCollectorInspectsSupervisorPanesConcurrently(t *testing.T) {
+	root := t.TempDir()
+	now := time.Date(2026, 7, 26, 12, 0, 0, 0, time.UTC)
+	for i := range 4 {
+		dir := filepath.Join(root, fmt.Sprintf("task-%d", i), "api")
+		wt := filepath.Join(root, fmt.Sprintf("task-%d-wt", i))
+		mustMkdirAll(t, dir)
+		mustMkdirAll(t, wt)
+		writeFile(t, filepath.Join(dir, "status"), "in_progress\n")
+		writeFile(t, filepath.Join(dir, "pane"), fmt.Sprintf("pane-%d\n", i))
+		writeFile(t, filepath.Join(dir, "worktree"), wt+"\n")
+		setModTime(t, filepath.Join(dir, "status"), now.Add(-time.Minute))
+	}
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	started := make(chan struct{}, 4)
+	release := make(chan struct{})
+	var current atomic.Int32
+	var maximum atomic.Int32
+	collector := dashboard.Collector{
+		FleetRoot:    root,
+		Now:          func() time.Time { return now },
+		StaleAfter:   15 * time.Minute,
+		ProbeTimeout: 200 * time.Millisecond,
+		InspectSupervisor: func(ctx context.Context, _, _ string) (bool, error) {
+			now := current.Add(1)
+			defer current.Add(-1)
+			for {
+				old := maximum.Load()
+				if now <= old || maximum.CompareAndSwap(old, now) {
+					break
+				}
+			}
+			started <- struct{}{}
+			select {
+			case <-release:
+				return false, nil
+			case <-ctx.Done():
+				return false, ctx.Err()
+			}
+		},
+	}
+
+	done := make(chan dashboard.State, 1)
+	go func() {
+		done <- collector.Collect(ctx)
+	}()
+
+	for i := 0; i < 4; i++ {
+		select {
+		case <-started:
+		case <-time.After(time.Second):
+			cancel()
+			close(release)
+			<-done
+			t.Fatalf("supervisor inspections stalled before worker %d started", i+1)
+		}
+	}
+	close(release)
+	<-done
+
+	if got := maximum.Load(); got < 2 {
+		t.Fatalf("maximum concurrent supervisor inspections = %d, want at least 2", got)
+	}
+}
+
 func mustMkdirAll(t *testing.T, path string) {
 	t.Helper()
 	if err := os.MkdirAll(path, 0o755); err != nil {

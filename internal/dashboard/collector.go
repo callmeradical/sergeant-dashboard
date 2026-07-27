@@ -47,26 +47,28 @@ type State struct {
 }
 
 type Worker struct {
-	Task        string        `json:"task"`
-	Project     string        `json:"project"`
-	Repository  string        `json:"repository,omitempty"`
-	Status      string        `json:"status,omitempty"`
-	Health      string        `json:"health"`
-	Agent       string        `json:"agent,omitempty"`
-	Branch      string        `json:"branch,omitempty"`
-	TDTask      string        `json:"tdTask,omitempty"`
-	TD          FileMetadata  `json:"td"`
-	Worktree    string        `json:"worktree,omitempty"`
-	UpdatedAt   time.Time     `json:"updatedAt,omitempty"`
-	Message     FileMetadata  `json:"message"`
-	Diagnostic  FileMetadata  `json:"diagnostic"`
-	Log         FileMetadata  `json:"log"`
-	Handoff     FileMetadata  `json:"handoff"`
-	PullRequest PullRequest   `json:"pullRequest"`
-	NoMistakes  ToolStatus    `json:"noMistakes"`
-	Graphify    FileMetadata  `json:"graphify"`
-	OCInject    AuditMetadata `json:"ocInject"`
-	enrichable  bool
+	Task           string        `json:"task"`
+	Project        string        `json:"project"`
+	Repository     string        `json:"repository,omitempty"`
+	Status         string        `json:"status,omitempty"`
+	Health         string        `json:"health"`
+	Agent          string        `json:"agent,omitempty"`
+	Branch         string        `json:"branch,omitempty"`
+	TDTask         string        `json:"tdTask,omitempty"`
+	TD             FileMetadata  `json:"td"`
+	Worktree       string        `json:"worktree,omitempty"`
+	UpdatedAt      time.Time     `json:"updatedAt,omitempty"`
+	Message        FileMetadata  `json:"message"`
+	Diagnostic     FileMetadata  `json:"diagnostic"`
+	Log            FileMetadata  `json:"log"`
+	Handoff        FileMetadata  `json:"handoff"`
+	PullRequest    PullRequest   `json:"pullRequest"`
+	NoMistakes     ToolStatus    `json:"noMistakes"`
+	Graphify       FileMetadata  `json:"graphify"`
+	OCInject       AuditMetadata `json:"ocInject"`
+	enrichable     bool
+	supervisorPane string
+	stateDir       string
 }
 
 type FileMetadata struct {
@@ -153,8 +155,73 @@ func (c Collector) Collect(ctx context.Context) State {
 		}
 		return state.Workers[i].Task < state.Workers[j].Task
 	})
+	c.inspectWorkers(ctx, now, staleAfter, state.Workers)
 	c.enrichWorkers(ctx, state.Workers)
 	return state
+}
+
+func (c Collector) inspectWorkers(ctx context.Context, now time.Time, staleAfter time.Duration, workers []Worker) {
+	inspectionCount := 0
+	for index := range workers {
+		if workers[index].supervisorPane != "" {
+			inspectionCount++
+		}
+	}
+	if inspectionCount == 0 {
+		return
+	}
+
+	inspect := c.InspectSupervisor
+	if inspect == nil {
+		inspect = inspectSupervisor
+	}
+	probeTimeout := c.ProbeTimeout
+	if probeTimeout <= 0 {
+		probeTimeout = 3 * time.Second
+	}
+	inspectionTime := maxEnrichmentTime
+	if probeTimeout <= maxEnrichmentTime/maxEnrichmentBatches {
+		inspectionTime = maxEnrichmentBatches * probeTimeout
+	}
+	batchCount := (inspectionCount + maxConcurrentWorkers - 1) / maxConcurrentWorkers
+	if batchCount > 0 {
+		probeTimeout = min(probeTimeout, inspectionTime/time.Duration(batchCount))
+	}
+
+	workerCount := min(maxConcurrentWorkers, inspectionCount)
+	jobs := make(chan *Worker)
+	var wait sync.WaitGroup
+	wait.Add(workerCount)
+	for range workerCount {
+		go func() {
+			defer wait.Done()
+			for worker := range jobs {
+				inspectCtx, cancel := context.WithTimeout(ctx, probeTimeout)
+				live, err := inspect(inspectCtx, worker.supervisorPane, worker.stateDir)
+				cancel()
+				activityAt := latestTime(worker.UpdatedAt, latestTime(worker.Log.UpdatedAt, latestTime(worker.Message.UpdatedAt, worker.Diagnostic.UpdatedAt)))
+				if err == nil && live {
+					worker.Health = "active"
+				} else {
+					worker.Health = ageHealth(activityAt, now, staleAfter)
+				}
+			}
+		}()
+	}
+	for index := range workers {
+		if workers[index].supervisorPane == "" {
+			continue
+		}
+		select {
+		case jobs <- &workers[index]:
+		case <-ctx.Done():
+			close(jobs)
+			wait.Wait()
+			return
+		}
+	}
+	close(jobs)
+	wait.Wait()
 }
 
 func (c Collector) enrichWorkers(ctx context.Context, workers []Worker) {
@@ -435,31 +502,14 @@ func (c Collector) collectWorker(ctx context.Context, dir, task, project string,
 
 	activityAt := latestTime(worker.UpdatedAt, latestTime(worker.Log.UpdatedAt, latestTime(worker.Message.UpdatedAt, worker.Diagnostic.UpdatedAt)))
 
-	// Classify health using supervisor identity when a pane file is present.
 	pane, _, _ := readScalarWithTime(filepath.Join(dir, "pane"))
 	if pane != "" {
-		inspect := c.InspectSupervisor
-		if inspect == nil {
-			inspect = inspectSupervisor
-		}
-		live, err := inspect(ctx, pane, dir)
-		if err != nil {
-			// Inspection unavailable (e.g. tmux not running); fall back to
-			// timestamp-based classification so the worker is not silently
-			// excluded from the operational set.
-			worker.Health = ageHealth(activityAt, now, staleAfter)
-			return worker, warnings
-		}
-		if live {
-			worker.Health = "active"
-			return worker, warnings
-		}
-		// Dead pane: stale if timestamp is old, otherwise orphaned.
 		worker.Health = ageHealth(activityAt, now, staleAfter)
+		worker.supervisorPane = pane
+		worker.stateDir = dir
 		return worker, warnings
 	}
 
-	// No pane file: classify by status timestamp alone.
 	if !activityAt.IsZero() && now.Sub(activityAt) > staleAfter {
 		worker.Health = "stale"
 	} else if worker.Status != "" {

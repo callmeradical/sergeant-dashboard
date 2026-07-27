@@ -121,6 +121,7 @@ func projectState(state State) projectedState {
 	// before truncation so active workers are never dropped behind a wall of
 	// stale/complete/unknown inventory.
 	var completeCount, staleCount, unknownCount int
+	truncatedWorkers := false
 	for i := range state.Workers {
 		switch state.Workers[i].Health {
 		case "complete":
@@ -130,7 +131,11 @@ func projectState(state State) projectedState {
 		case "unknown":
 			unknownCount++
 		default:
-			if isOperational(state.Workers[i].Health) && len(projected.Workers) < maxProjectedWorkers {
+			if isOperational(state.Workers[i].Health) {
+				if len(projected.Workers) >= maxProjectedWorkers {
+					truncatedWorkers = true
+					continue
+				}
 				w := &state.Workers[i]
 				projected.Workers = append(projected.Workers, projectedWorker{
 					Task: RedactText(w.Task), Project: RedactText(w.Project), Repository: RedactText(w.Repository), Status: RedactText(w.Status), Health: RedactText(w.Health), Agent: RedactText(w.Agent), Branch: RedactText(w.Branch), TDTask: validTDTask(w.TDTask), Worktree: RedactText(w.Worktree), UpdatedAt: w.UpdatedAt,
@@ -154,7 +159,7 @@ func projectState(state State) projectedState {
 	for _, warning := range state.Warnings[:warningCount] {
 		projected.Warnings = append(projected.Warnings, RedactText(warning))
 	}
-	if len(state.Warnings) > warningCount || len(projected.Workers) >= maxProjectedWorkers {
+	if len(state.Warnings) > warningCount || truncatedWorkers {
 		projected.Warnings = append(projected.Warnings, "projection truncated at safety limit")
 	}
 	return projected

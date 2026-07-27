@@ -336,6 +336,21 @@ func TestStateAPIFiltersBeforeTruncating(t *testing.T) {
 	}
 }
 
+func TestStateAPIDoesNotWarnAtExactOperationalLimit(t *testing.T) {
+	workers := make([]dashboard.Worker, 1000)
+	for i := range workers {
+		workers[i] = dashboard.Worker{Task: fmt.Sprintf("active-%04d", i), Health: "active", Status: "in_progress"}
+	}
+
+	response := request(t, dashboard.NewHandler(fixedSource{state: dashboard.State{Workers: workers, Warnings: []string{}}}), http.MethodGet, "/sergeant/api/state")
+	if response.Code != http.StatusOK {
+		t.Fatalf("state response = %d", response.Code)
+	}
+	if strings.Contains(response.Body.String(), "projection truncated at safety limit") {
+		t.Fatalf("exact operational limit reported truncation: %s", response.Body.String())
+	}
+}
+
 // TestStateAPIProjectsOnlyOperationalWorkersFromMixedHistory reproduces the
 // 154-record live failure: the API should return only the operational set
 // (verified active workers and actionable orphaned records), not the full
