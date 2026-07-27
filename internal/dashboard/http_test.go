@@ -595,10 +595,10 @@ func TestStateAPIProjectsLegacyCheckContextName(t *testing.T) {
 	state := dashboard.State{
 		CollectedAt: time.Now(),
 		Workers: []dashboard.Worker{{
-			Task:   "task-1",
+			Task:    "task-1",
 			Project: "api",
-			Health: "active",
-			Status: "in_progress",
+			Health:  "active",
+			Status:  "in_progress",
 			PullRequest: dashboard.PullRequest{
 				URL:    "https://github.com/acme/api/pull/1",
 				State:  "OPEN",
