@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -8,7 +8,11 @@ import { createServer } from 'node:net';
 import { request } from 'node:http';
 
 const browser = process.env.CHROME_BIN;
-const fixtures = JSON.parse(Buffer.from(process.env.FRONTEND_FIXTURES, 'base64'));
+// Fixtures are written to a file to avoid exec env var size limits.
+const fixtureData = process.env.FRONTEND_FIXTURES_FILE
+  ? await readFile(process.env.FRONTEND_FIXTURES_FILE, 'utf8')
+  : process.env.FRONTEND_FIXTURES;
+const fixtures = JSON.parse(Buffer.from(fixtureData, 'base64'));
 
 const delay = milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds));
 
