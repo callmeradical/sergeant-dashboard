@@ -57,6 +57,73 @@ func TestCollectorProbesWorkersConcurrently(t *testing.T) {
 	}
 }
 
+// TestEnrichWorkersBoundsToMaxConcurrentWorkers verifies that a 20-worker fleet
+// still bounds enrichment goroutines to maxConcurrentWorkers.
+// It samples goroutine growth while probes are blocked. With an 8-worker
+// dispatcher, growth should stay at or below 40 goroutines instead of scaling
+// linearly with the fleet size.
+func TestEnrichWorkersBoundsToMaxConcurrentWorkers(t *testing.T) {
+	root := t.TempDir()
+	const workerCount = 20
+	for index := 0; index < workerCount; index++ {
+		worker := filepath.Join(root, fmt.Sprintf("task-%02d", index), "api")
+		worktree := filepath.Join(root, fmt.Sprintf("worktree-%02d", index))
+		mustMkdirAll(t, worker)
+		mustMkdirAll(t, worktree)
+		writeFile(t, filepath.Join(worker, "status"), "in_progress\n")
+		writeFile(t, filepath.Join(worker, "worktree"), worktree+"\n")
+	}
+
+	release := make(chan struct{})
+	ready := make(chan struct{})
+	var active atomic.Int32
+	var once sync.Once
+	runner := func(ctx context.Context, _ string, _ string, _ ...string) ([]byte, error) {
+		if active.Add(1) == 16 { // process-wide slot ceiling reached
+			once.Do(func() { close(ready) })
+		}
+		defer active.Add(-1)
+		select {
+		case <-release:
+			return []byte(`{}`), nil
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+
+	baseline := runtime.NumGoroutine()
+	done := make(chan struct{})
+	go func() {
+		dashboard.Collector{FleetRoot: root, Run: runner, ProbeTimeout: 5 * time.Second}.Collect(t.Context())
+		close(done)
+	}()
+	select {
+	case <-ready:
+	case <-time.After(2 * time.Second):
+		close(release)
+		t.Fatal("collector did not saturate the process-wide probe limit")
+	}
+
+	// Sample goroutine growth while at peak load.
+	growth := runtime.NumGoroutine() - baseline
+	close(release)
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("collector did not finish after release")
+	}
+
+	// With 20 workers bounded to 8 concurrent by the semaphore, goroutine growth
+	// stays capped at 40 instead of tracking the full fleet size.
+	const maxGrowth = 40
+	if growth > maxGrowth {
+		t.Fatalf("goroutine growth = %d with 20 workers, want <= %d (semaphore pool must limit to 8 concurrent)", growth, maxGrowth)
+	}
+	if got := active.Load(); got != 0 {
+		t.Fatalf("active probes after collection = %d, want 0", got)
+	}
+}
+
 func TestCollectorsShareProcessWideProbeLimit(t *testing.T) {
 	root := t.TempDir()
 	for index := 0; index < 8; index++ {

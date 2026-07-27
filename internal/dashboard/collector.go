@@ -277,29 +277,28 @@ func (c Collector) enrichWorkers(ctx context.Context, workers []Worker) {
 	probeCollector := c
 	probeCollector.ProbeTimeout = probeTimeout
 
-	workerCount := min(maxConcurrentWorkers, len(workers))
-	jobs := make(chan *Worker)
-	var wait sync.WaitGroup
-	wait.Add(workerCount)
-	for range workerCount {
-		go func() {
-			defer wait.Done()
-			for worker := range jobs {
-				probeCollector.enrichWorker(ctx, worker)
-			}
-		}()
-	}
+	// Semaphore of size maxConcurrentWorkers: the dispatcher acquires one slot
+	// before launching each goroutine and the goroutine releases it on return.
+	// This bounds concurrent goroutines to maxConcurrentWorkers (not fleet size),
+	// fixing both td-ab7c04 and td-577246.
+	sem := make(chan struct{}, maxConcurrentWorkers)
+	var wg sync.WaitGroup
+dispatch:
 	for index := range workers {
 		select {
-		case jobs <- &workers[index]:
+		case sem <- struct{}{}:
 		case <-ctx.Done():
-			close(jobs)
-			wait.Wait()
-			return
+			break dispatch
 		}
+		wg.Add(1)
+		w := &workers[index]
+		go func() {
+			defer wg.Done()
+			defer func() { <-sem }()
+			probeCollector.enrichWorker(ctx, w)
+		}()
 	}
-	close(jobs)
-	wait.Wait()
+	wg.Wait()
 }
 
 func (c Collector) enrichWorker(parent context.Context, worker *Worker) {
