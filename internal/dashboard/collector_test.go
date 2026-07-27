@@ -1188,6 +1188,44 @@ func TestCollectorDoesNotShrinkSupervisorProbeTimeoutByFleetSize(t *testing.T) {
 	}
 }
 
+func TestCollectorDoesNotCascadeSupervisorDeadlineAcrossBatches(t *testing.T) {
+	root := t.TempDir()
+	now := time.Date(2026, 7, 26, 12, 0, 0, 0, time.UTC)
+	const workerCount = 9
+	for i := 0; i < workerCount; i++ {
+		dir := filepath.Join(root, fmt.Sprintf("task-%02d", i), "api")
+		wt := filepath.Join(root, fmt.Sprintf("task-%02d-wt", i))
+		mustMkdirAll(t, dir)
+		mustMkdirAll(t, wt)
+		writeFile(t, filepath.Join(dir, "status"), "in_progress\n")
+		writeFile(t, filepath.Join(dir, "pane"), fmt.Sprintf("pane-%02d\n", i))
+		writeFile(t, filepath.Join(dir, "worktree"), wt+"\n")
+		setModTime(t, filepath.Join(dir, "status"), now.Add(-time.Hour))
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 250*time.Millisecond)
+	defer cancel()
+	state := dashboard.Collector{
+		FleetRoot:  root,
+		Now:        func() time.Time { return now },
+		StaleAfter: 15 * time.Minute,
+		InspectSupervisor: func(ctx context.Context, _, _ string) (bool, error) {
+			select {
+			case <-time.After(150 * time.Millisecond):
+				return true, nil
+			case <-ctx.Done():
+				return false, ctx.Err()
+			}
+		},
+	}.Collect(ctx)
+
+	for _, worker := range state.Workers {
+		if worker.Health != "active" {
+			t.Fatalf("worker %s health = %q, want active", worker.Task, worker.Health)
+		}
+	}
+}
+
 func mustMkdirAll(t *testing.T, path string) {
 	t.Helper()
 	if err := os.MkdirAll(path, 0o755); err != nil {

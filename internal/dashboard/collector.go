@@ -16,11 +16,12 @@ import (
 )
 
 const (
-	maxScalarBytes       = 4096
-	maxOperationalBytes  = 64 << 10
-	maxConcurrentWorkers = 8
-	maxEnrichmentBatches = 4
-	maxEnrichmentTime    = 12 * time.Second
+	maxScalarBytes         = 4096
+	maxOperationalBytes    = 64 << 10
+	maxConcurrentWorkers   = 8
+	maxEnrichmentBatches   = 4
+	maxEnrichmentTime      = 12 * time.Second
+	supervisorProbeTimeout = 2 * time.Second
 )
 
 var processProbeSlots = make(chan struct{}, 2*maxConcurrentWorkers)
@@ -188,7 +189,7 @@ func (c Collector) inspectWorkers(ctx context.Context, now time.Time, staleAfter
 		go func() {
 			defer wait.Done()
 			for worker := range jobs {
-				inspectCtx, cancel := context.WithTimeout(ctx, probeTimeout)
+				inspectCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), probeTimeout)
 				live, err := inspect(inspectCtx, worker.supervisorPane, worker.stateDir)
 				cancel()
 				activityAt := latestTime(worker.UpdatedAt, latestTime(worker.Log.UpdatedAt, latestTime(worker.Message.UpdatedAt, worker.Diagnostic.UpdatedAt)))
@@ -217,10 +218,7 @@ func (c Collector) inspectWorkers(ctx context.Context, now time.Time, staleAfter
 }
 
 func (c Collector) enrichWorkers(ctx context.Context, workers []Worker) {
-	probeTimeout := c.ProbeTimeout
-	if probeTimeout <= 0 {
-		probeTimeout = 3 * time.Second
-	}
+	probeTimeout := supervisorProbeTimeout
 	enrichmentTime := maxEnrichmentTime
 	if probeTimeout <= maxEnrichmentTime/maxEnrichmentBatches {
 		enrichmentTime = maxEnrichmentBatches * probeTimeout
