@@ -952,6 +952,7 @@ func TestCollectorClassifiesActiveWithLiveSupervisorAndOrphanedWithoutIt(t *test
 
 	var inspectedMu sync.Mutex
 	inspected := make(map[string]int)
+	var inspectedMu sync.Mutex
 	collector := dashboard.Collector{
 		FleetRoot:  root,
 		Now:        func() time.Time { return now },
