@@ -176,10 +176,7 @@ func (c Collector) inspectWorkers(ctx context.Context, now time.Time, staleAfter
 	if inspect == nil {
 		inspect = inspectSupervisor
 	}
-	probeTimeout := c.ProbeTimeout
-	if probeTimeout <= 0 {
-		probeTimeout = 3 * time.Second
-	}
+	probeTimeout := supervisorProbeTimeout
 
 	workerCount := min(maxConcurrentWorkers, inspectionCount)
 	jobs := make(chan *Worker)
@@ -208,6 +205,12 @@ func (c Collector) inspectWorkers(ctx context.Context, now time.Time, staleAfter
 		select {
 		case jobs <- &workers[index]:
 		case <-ctx.Done():
+			workers[index].Health = ageHealth(workers[index].UpdatedAt, now, staleAfter)
+			for remaining := index + 1; remaining < len(workers); remaining++ {
+				if workers[remaining].supervisorPane != "" {
+					workers[remaining].Health = ageHealth(workers[remaining].UpdatedAt, now, staleAfter)
+				}
+			}
 			close(jobs)
 			wait.Wait()
 			return
@@ -218,7 +221,10 @@ func (c Collector) inspectWorkers(ctx context.Context, now time.Time, staleAfter
 }
 
 func (c Collector) enrichWorkers(ctx context.Context, workers []Worker) {
-	probeTimeout := supervisorProbeTimeout
+	probeTimeout := c.ProbeTimeout
+	if probeTimeout <= 0 {
+		probeTimeout = 3 * time.Second
+	}
 	enrichmentTime := maxEnrichmentTime
 	if probeTimeout <= maxEnrichmentTime/maxEnrichmentBatches {
 		enrichmentTime = maxEnrichmentBatches * probeTimeout

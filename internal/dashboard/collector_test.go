@@ -1164,7 +1164,7 @@ func TestCollectorDoesNotShrinkSupervisorProbeTimeoutByFleetSize(t *testing.T) {
 		FleetRoot:    root,
 		Now:          func() time.Time { return now },
 		StaleAfter:   15 * time.Minute,
-		ProbeTimeout: 300 * time.Millisecond,
+		ProbeTimeout: 100 * time.Millisecond,
 		InspectSupervisor: func(ctx context.Context, _, _ string) (bool, error) {
 			select {
 			case <-time.After(250 * time.Millisecond):
@@ -1223,6 +1223,38 @@ func TestCollectorDoesNotCascadeSupervisorDeadlineAcrossBatches(t *testing.T) {
 		if worker.Health != "active" {
 			t.Fatalf("worker %s health = %q, want active", worker.Task, worker.Health)
 		}
+	}
+}
+
+func TestCollectorHonorsConfiguredEnrichmentProbeTimeout(t *testing.T) {
+	root := t.TempDir()
+	worker := filepath.Join(root, "task-a", "api")
+	worktree := filepath.Join(root, "worktree")
+	mustMkdirAll(t, worker)
+	mustMkdirAll(t, worktree)
+	writeFile(t, filepath.Join(worker, "status"), "in_progress\n")
+	writeFile(t, filepath.Join(worker, "worktree"), worktree+"\n")
+	writeFile(t, filepath.Join(worker, "repository"), "acme/api\n")
+
+	runner := func(ctx context.Context, _ string, name string, _ ...string) ([]byte, error) {
+		select {
+		case <-time.After(2500 * time.Millisecond):
+			if name == "gh" {
+				return []byte(`{"url":"https://github.com/acme/api/pull/7","state":"OPEN","statusCheckRollup":[],"comments":[]}`), nil
+			}
+			return []byte("review passed"), nil
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+
+	state := dashboard.Collector{FleetRoot: root, Run: runner, ProbeTimeout: 3 * time.Second}.Collect(t.Context())
+	workerState := state.Workers[0]
+	if workerState.PullRequest.URL == "" {
+		t.Fatalf("pull request probe ignored configured timeout: %#v", workerState.PullRequest)
+	}
+	if !workerState.NoMistakes.Available {
+		t.Fatalf("no-mistakes probe ignored configured timeout: %#v", workerState.NoMistakes)
 	}
 }
 
