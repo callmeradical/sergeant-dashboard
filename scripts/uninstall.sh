@@ -10,6 +10,7 @@ bin_dir=${HOME}/.local/bin
 unit_dir=${XDG_CONFIG_HOME:-${HOME}/.config}/systemd/user
 
 disable_status=0
+systemctl --user disable --now sergeant-dashboard-tailnet-proxy.service 2>/dev/null || true
 if ! systemctl --user disable --now sergeant-dashboard.service 2>/dev/null; then
 	disable_status=1
 fi
@@ -27,7 +28,7 @@ else
 		exit 1
 	fi
 fi
-rm -f "$unit_dir/sergeant-dashboard.service" "$bin_dir/sergeant-dashboard"
+rm -f "$unit_dir/sergeant-dashboard.service" "$unit_dir/sergeant-dashboard-tailnet-proxy.service" "$bin_dir/sergeant-dashboard"
 systemctl --user daemon-reload
 
 printf '%s\n' "Uninstalled sergeant-dashboard"
