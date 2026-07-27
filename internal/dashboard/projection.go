@@ -70,6 +70,7 @@ type projectedPullRequest struct {
 
 type projectedCheck struct {
 	Name       string `json:"name,omitempty"`
+	Context    string `json:"context,omitempty"`
 	Status     string `json:"status,omitempty"`
 	Conclusion string `json:"conclusion,omitempty"`
 	State      string `json:"state,omitempty"`
@@ -181,7 +182,7 @@ func projectPullRequest(pr PullRequest) projectedPullRequest {
 	}
 	projected := projectedPullRequest{URL: canonicalPullRequestURL(pr.URL), State: RedactText(pr.State), Status: status, Checks: make([]projectedCheck, 0, checkCount), Comments: make([]projectedComment, 0, commentCount)}
 	for _, check := range pr.Checks[:checkCount] {
-		projected.Checks = append(projected.Checks, projectedCheck{Name: RedactText(check.Name), Status: RedactText(check.Status), Conclusion: RedactText(check.Conclusion), State: RedactText(check.State)})
+		projected.Checks = append(projected.Checks, projectedCheck{Name: RedactText(check.Name), Context: RedactText(check.Context), Status: RedactText(check.Status), Conclusion: RedactText(check.Conclusion), State: RedactText(check.State)})
 	}
 	for _, comment := range pr.Comments[:commentCount] {
 		projected.Comments = append(projected.Comments, projectedComment{Author: RedactText(comment.Author), Body: RedactText(comment.Body), URL: canonicalGitHubURL(comment.URL), CreatedAt: comment.CreatedAt})

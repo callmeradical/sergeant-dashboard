@@ -2,6 +2,7 @@ package dashboard
 
 import (
 	"path/filepath"
+	"strconv"
 	"time"
 )
 
@@ -11,6 +12,9 @@ type Config struct {
 	Address    string
 	FleetRoot  string
 	StaleAfter time.Duration
+	// Limit caps the number of workers the Collector materialises during the
+	// fleet scan. Zero means unlimited. Set SERGEANT_WORKER_LIMIT to configure.
+	Limit int
 }
 
 func ConfigFromEnv(getenv func(string) string) Config {
@@ -26,5 +30,9 @@ func ConfigFromEnv(getenv func(string) string) Config {
 	if err != nil || staleAfter <= 0 {
 		staleAfter = 30 * time.Minute
 	}
-	return Config{Address: ListenAddress, FleetRoot: fleetRoot, StaleAfter: staleAfter}
+	limit, _ := strconv.Atoi(getenv("SERGEANT_WORKER_LIMIT"))
+	if limit < 0 {
+		limit = 0
+	}
+	return Config{Address: ListenAddress, FleetRoot: fleetRoot, StaleAfter: staleAfter, Limit: limit}
 }
