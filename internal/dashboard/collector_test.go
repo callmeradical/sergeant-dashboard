@@ -950,13 +950,16 @@ func TestCollectorClassifiesActiveWithLiveSupervisorAndOrphanedWithoutIt(t *test
 		}
 	}
 
+	var inspectedMu sync.Mutex
 	inspected := make(map[string]int)
 	collector := dashboard.Collector{
 		FleetRoot:  root,
 		Now:        func() time.Time { return now },
 		StaleAfter: 15 * time.Minute,
 		InspectSupervisor: func(_ context.Context, pane, _ string) (bool, error) {
+			inspectedMu.Lock()
 			inspected[pane]++
+			inspectedMu.Unlock()
 			return pane == "live-pane", nil
 		},
 	}
@@ -971,7 +974,10 @@ func TestCollectorClassifiesActiveWithLiveSupervisorAndOrphanedWithoutIt(t *test
 			t.Errorf("%s health = %q, want %q", test.task, got, test.wantHealth)
 		}
 	}
-	if inspected["live-pane"] == 0 {
+	inspectedMu.Lock()
+	livePaneCount := inspected["live-pane"]
+	inspectedMu.Unlock()
+	if livePaneCount == 0 {
 		t.Error("supervisor inspector was not called for pane-bearing workers")
 	}
 }
