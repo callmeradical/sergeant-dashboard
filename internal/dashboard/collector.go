@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -22,6 +23,7 @@ const (
 	maxEnrichmentBatches   = 4
 	maxEnrichmentTime      = 12 * time.Second
 	supervisorProbeTimeout = 2 * time.Second
+	dirReadBatchSize       = 32
 )
 
 var processProbeSlots = make(chan struct{}, 2*maxConcurrentWorkers)
@@ -130,54 +132,52 @@ func (c Collector) Collect(ctx context.Context) State {
 		staleAfter = 30 * time.Minute
 	}
 	state := State{CollectedAt: now, Workers: []Worker{}, Warnings: []string{}}
-
-	tasks, err := os.ReadDir(c.FleetRoot)
-	if err != nil {
-		state.Warnings = append(state.Warnings, "fleet source unavailable")
-		return state
-	}
 	truncatedByLimit := false
-outer:
-	for _, task := range tasks {
+	stopWalk := false
+	if err := forEachDirEntry(c.FleetRoot, func(task os.DirEntry) bool {
 		select {
 		case <-ctx.Done():
-			break outer
+			stopWalk = true
+			return false
 		default:
 		}
 		if !task.IsDir() {
-			continue
+			return true
 		}
-		// Check the limit before reading the next task's directory so a
-		// completed scan does not issue unnecessary ReadDir calls.
 		if c.Limit > 0 && len(state.Workers) >= c.Limit {
 			truncatedByLimit = true
-			break outer
+			stopWalk = true
+			return false
 		}
-		projects, err := os.ReadDir(filepath.Join(c.FleetRoot, task.Name()))
-		if err != nil {
-			state.Warnings = append(state.Warnings, fmt.Sprintf("task %s unavailable", task.Name()))
-			continue
-		}
-		for _, project := range projects {
-			if !project.IsDir() {
-				continue
-			}
+		taskName := task.Name()
+		if err := forEachDirEntry(filepath.Join(c.FleetRoot, taskName), func(project os.DirEntry) bool {
 			select {
 			case <-ctx.Done():
-				break outer
+				stopWalk = true
+				return false
 			default:
+			}
+			if !project.IsDir() {
+				return true
 			}
 			if c.Limit > 0 && len(state.Workers) >= c.Limit {
 				truncatedByLimit = true
-				break outer
+				stopWalk = true
+				return false
 			}
-			worker, warnings := c.collectWorker(ctx, filepath.Join(c.FleetRoot, task.Name(), project.Name()), task.Name(), project.Name(), now, staleAfter)
+			worker, warnings := c.collectWorker(ctx, filepath.Join(c.FleetRoot, taskName, project.Name()), taskName, project.Name(), now, staleAfter)
 			state.Workers = append(state.Workers, worker)
 			state.Warnings = append(state.Warnings, warnings...)
+			return true
+		}); err != nil {
+			state.Warnings = append(state.Warnings, fmt.Sprintf("task %s unavailable", taskName))
 		}
+		return !stopWalk
+	}); err != nil {
+		state.Warnings = append(state.Warnings, "fleet source unavailable")
 	}
 	if truncatedByLimit {
-		state.Warnings = append(state.Warnings, fmt.Sprintf("worker scan truncated at configured limit %d; fleet may be partial", c.Limit))
+		state.Warnings = append([]string{fmt.Sprintf("worker scan truncated at configured limit %d; fleet may be partial", c.Limit)}, state.Warnings...)
 	}
 	sort.Slice(state.Workers, func(i, j int) bool {
 		if state.Workers[i].Task == state.Workers[j].Task {
@@ -188,6 +188,32 @@ outer:
 	c.inspectWorkers(ctx, now, staleAfter, state.Workers)
 	c.enrichWorkers(ctx, state.Workers)
 	return state
+}
+
+func forEachDirEntry(path string, visit func(os.DirEntry) bool) error {
+	dir, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer dir.Close()
+
+	for {
+		entries, err := dir.ReadDir(dirReadBatchSize)
+		sort.Slice(entries, func(i, j int) bool {
+			return entries[i].Name() < entries[j].Name()
+		})
+		for _, entry := range entries {
+			if !visit(entry) {
+				return nil
+			}
+		}
+		if errors.Is(err, io.EOF) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+	}
 }
 
 func (c Collector) inspectWorkers(ctx context.Context, now time.Time, staleAfter time.Duration, workers []Worker) {

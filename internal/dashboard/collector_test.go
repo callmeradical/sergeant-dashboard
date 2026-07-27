@@ -1348,6 +1348,28 @@ func TestCollectorAddsWarningWhenLimitTruncatesScan(t *testing.T) {
 	}
 }
 
+func TestCollectorPrependsLimitWarningAheadOfWorkerWarnings(t *testing.T) {
+	root := t.TempDir()
+
+	firstWorker := filepath.Join(root, "task-00", "api")
+	mustMkdirAll(t, firstWorker)
+
+	secondWorker := filepath.Join(root, "task-01", "api")
+	mustMkdirAll(t, secondWorker)
+	writeFile(t, filepath.Join(secondWorker, "status"), "in_progress\n")
+
+	state := dashboard.Collector{FleetRoot: root, Limit: 1}.Collect(t.Context())
+	if len(state.Warnings) < 2 {
+		t.Fatalf("warnings = %v, want truncation warning plus worker warning", state.Warnings)
+	}
+	if !strings.Contains(state.Warnings[0], "truncated") {
+		t.Fatalf("warnings[0] = %q, want leading truncation warning so projection cannot drop it", state.Warnings[0])
+	}
+	if !strings.Contains(state.Warnings[1], "invalid status") {
+		t.Fatalf("warnings[1] = %q, want worker warning preserved after truncation warning", state.Warnings[1])
+	}
+}
+
 func TestCollectorLimitGuardFiresBeforeReadingNextTask(t *testing.T) {
 	// Arrange: exactly `limit` projects spread across two separate tasks, each
 	// holding one project.  After the first task fills the limit, the outer
