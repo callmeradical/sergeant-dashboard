@@ -13,6 +13,7 @@ curl --fail --silent --show-error "$tailnet_url" >/dev/null
 # Asserts: workers array present, every worker has health in the operational
 # set (active|orphaned), no stale/complete/unknown workers in the response.
 # Requires jq. Only asserts when the API is reachable.
+api_state_result='API state check skipped (jq unavailable or API unreachable)'
 if command -v jq >/dev/null 2>&1; then
   state=$(curl --fail --silent http://127.0.0.1:8992/sergeant/api/state 2>/dev/null) || state=''
   if [ -n "$state" ]; then
@@ -30,8 +31,9 @@ if command -v jq >/dev/null 2>&1; then
       exit 1
     fi
 
-    printf 'API state check passed: total=%s active=%s\n' "$total" "$active"
+    api_state_result='API state check passed'
   fi
 fi
 
-printf '%s\n' "Local health, local UI, Tailscale Serve, tailnet HTTPS, and API state checks passed"
+printf '%s\n' "Local health, local UI, Tailscale Serve, and tailnet HTTPS checks passed"
+printf '%s\n' "$api_state_result"

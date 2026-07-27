@@ -179,14 +179,6 @@ func (c Collector) inspectWorkers(ctx context.Context, now time.Time, staleAfter
 	if probeTimeout <= 0 {
 		probeTimeout = 3 * time.Second
 	}
-	inspectionTime := maxEnrichmentTime
-	if probeTimeout <= maxEnrichmentTime/maxEnrichmentBatches {
-		inspectionTime = maxEnrichmentBatches * probeTimeout
-	}
-	batchCount := (inspectionCount + maxConcurrentWorkers - 1) / maxConcurrentWorkers
-	if batchCount > 0 {
-		probeTimeout = min(probeTimeout, inspectionTime/time.Duration(batchCount))
-	}
 
 	workerCount := min(maxConcurrentWorkers, inspectionCount)
 	jobs := make(chan *Worker)
