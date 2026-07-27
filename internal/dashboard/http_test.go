@@ -529,8 +529,14 @@ func TestEmbeddedApplicationRendersBrowserBehavior(t *testing.T) {
 		t.Fatal("Chrome or Chromium is required for frontend behavior tests")
 	}
 
+	// Write fixtures to a temp file to avoid exceeding exec env var size limits.
+	fixtureFile := filepath.Join(t.TempDir(), "fixtures.json.b64")
+	if err := os.WriteFile(fixtureFile, []byte(base64.StdEncoding.EncodeToString(fixtureJSON)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
 	command := exec.Command("node", "testdata/frontend_test.mjs")
-	command.Env = append(os.Environ(), "CHROME_BIN="+browser, "FRONTEND_FIXTURES="+base64.StdEncoding.EncodeToString(fixtureJSON))
+	command.Env = append(os.Environ(), "CHROME_BIN="+browser, "FRONTEND_FIXTURES_FILE="+fixtureFile)
 	if output, err := command.CombinedOutput(); err != nil {
 		t.Fatalf("frontend behavior: %v: %s", err, output)
 	}
