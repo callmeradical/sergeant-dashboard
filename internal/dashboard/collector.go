@@ -136,6 +136,7 @@ func (c Collector) Collect(ctx context.Context) State {
 		state.Warnings = append(state.Warnings, "fleet source unavailable")
 		return state
 	}
+	truncatedByLimit := false
 outer:
 	for _, task := range tasks {
 		select {
@@ -145,6 +146,12 @@ outer:
 		}
 		if !task.IsDir() {
 			continue
+		}
+		// Check the limit before reading the next task's directory so a
+		// completed scan does not issue unnecessary ReadDir calls.
+		if c.Limit > 0 && len(state.Workers) >= c.Limit {
+			truncatedByLimit = true
+			break outer
 		}
 		projects, err := os.ReadDir(filepath.Join(c.FleetRoot, task.Name()))
 		if err != nil {
@@ -161,12 +168,16 @@ outer:
 			default:
 			}
 			if c.Limit > 0 && len(state.Workers) >= c.Limit {
+				truncatedByLimit = true
 				break outer
 			}
 			worker, warnings := c.collectWorker(ctx, filepath.Join(c.FleetRoot, task.Name(), project.Name()), task.Name(), project.Name(), now, staleAfter)
 			state.Workers = append(state.Workers, worker)
 			state.Warnings = append(state.Warnings, warnings...)
 		}
+	}
+	if truncatedByLimit {
+		state.Warnings = append(state.Warnings, fmt.Sprintf("worker scan truncated at configured limit %d; fleet may be partial", c.Limit))
 	}
 	sort.Slice(state.Workers, func(i, j int) bool {
 		if state.Workers[i].Task == state.Workers[j].Task {

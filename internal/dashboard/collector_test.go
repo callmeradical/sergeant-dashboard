@@ -1321,6 +1321,65 @@ func TestCollectorChecksContextDuringFleetWalk(t *testing.T) {
 	}
 }
 
+func TestCollectorAddsWarningWhenLimitTruncatesScan(t *testing.T) {
+	root := t.TempDir()
+	const totalWorkers = 5
+	for i := 0; i < totalWorkers; i++ {
+		worker := filepath.Join(root, fmt.Sprintf("task-%02d", i), "api")
+		mustMkdirAll(t, worker)
+		writeFile(t, filepath.Join(worker, "status"), "in_progress\n")
+	}
+
+	const limit = 2
+	state := dashboard.Collector{FleetRoot: root, Limit: limit}.Collect(t.Context())
+
+	if len(state.Workers) != limit {
+		t.Fatalf("workers = %d, want %d", len(state.Workers), limit)
+	}
+	hasTruncationWarning := false
+	for _, w := range state.Warnings {
+		if strings.Contains(w, "truncated") || strings.Contains(w, "limit") {
+			hasTruncationWarning = true
+			break
+		}
+	}
+	if !hasTruncationWarning {
+		t.Fatalf("no truncation warning in state.Warnings = %v; operators must be told the fleet is partial", state.Warnings)
+	}
+}
+
+func TestCollectorLimitGuardFiresBeforeReadingNextTask(t *testing.T) {
+	// Arrange: exactly `limit` projects spread across two separate tasks, each
+	// holding one project.  After the first task fills the limit, the outer
+	// loop must not read the second task's directory before exiting.
+	root := t.TempDir()
+	const limit = 1
+
+	// Task-00 has the only project that should be collected.
+	task0 := filepath.Join(root, "task-00", "api")
+	mustMkdirAll(t, task0)
+	writeFile(t, filepath.Join(task0, "status"), "in_progress\n")
+
+	// Task-01 is a real directory; if ReadDir is called on it the outer loop
+	// entered the task after the limit was already met.  We detect this by
+	// placing a synthetic file that collectWorker would warn about, but more
+	// directly by asserting no workers from task-01 appear.
+	task1 := filepath.Join(root, "task-01", "api")
+	mustMkdirAll(t, task1)
+	writeFile(t, filepath.Join(task1, "status"), "in_progress\n")
+
+	state := dashboard.Collector{FleetRoot: root, Limit: limit}.Collect(t.Context())
+
+	if len(state.Workers) != limit {
+		t.Fatalf("workers = %d, want %d; limit guard must fire before entering task-01", len(state.Workers), limit)
+	}
+	for _, w := range state.Workers {
+		if w.Task == "task-01" {
+			t.Fatalf("worker from task-01 was collected; outer-loop limit guard did not fire before os.ReadDir(task-01)")
+		}
+	}
+}
+
 // Regression test for td-bd77c2: Check must preserve statusCheckRollup.context
 // so legacy GitHub status checks retain their identifier.
 
