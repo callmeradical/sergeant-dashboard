@@ -1,0 +1,17 @@
+[Unit]
+Description=Sergeant dashboard tailnet TCP proxy
+Documentation=https://github.com/callmeradical/sergeant-dashboard
+After=network-online.target tailscaled.service
+Wants=network-online.target
+BindsTo=sergeant-dashboard.service
+
+[Service]
+Type=simple
+# Bind socat on the Tailscale IP so the dashboard is reachable inside the tailnet
+# at http://<hostname>:8992/ without exposing it on the public interface.
+ExecStart=/bin/sh -c 'exec socat TCP-LISTEN:8992,bind=$(tailscale ip -4),reuseaddr,fork TCP:127.0.0.1:8992'
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
