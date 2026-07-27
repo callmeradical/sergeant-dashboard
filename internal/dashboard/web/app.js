@@ -5,6 +5,7 @@ const drawerClose = document.querySelector('#drawer-close');
 const drawerBody = document.querySelector('#drawer-body');
 const drawerProject = document.querySelector('#drawer-project');
 const drawerBadge = document.querySelector('#drawer-badge');
+const mainEl = document.querySelector('main');
 
 let state = { workers: [], warnings: [] };
 let filter = 'all';
@@ -40,6 +41,7 @@ function openDrawer(worker, cardEl) {
 
   drawer.classList.add('open');
   scrim.classList.add('open');
+  if (mainEl) mainEl.inert = true;
   drawer.focus();
 }
 
@@ -47,6 +49,7 @@ function closeDrawer() {
   const trigger = activeCard;
   drawer.classList.remove('open');
   scrim.classList.remove('open');
+  if (mainEl) mainEl.inert = false;
   if (activeCard) { activeCard.classList.remove('drawer-open'); activeCard = null; }
   // Restore focus to the card that opened the drawer.
   if (trigger) trigger.focus();
