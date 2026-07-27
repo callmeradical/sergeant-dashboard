@@ -130,13 +130,12 @@ func (c Collector) Collect(ctx context.Context) State {
 		staleAfter = 30 * time.Minute
 	}
 	state := State{CollectedAt: now, Workers: []Worker{}, Warnings: []string{}}
-
+	truncatedByLimit := false
 	tasks, err := os.ReadDir(c.FleetRoot)
 	if err != nil {
 		state.Warnings = append(state.Warnings, "fleet source unavailable")
 		return state
 	}
-	truncatedByLimit := false
 outer:
 	for _, task := range tasks {
 		select {
@@ -147,37 +146,36 @@ outer:
 		if !task.IsDir() {
 			continue
 		}
-		// Check the limit before reading the next task's directory so a
-		// completed scan does not issue unnecessary ReadDir calls.
 		if c.Limit > 0 && len(state.Workers) >= c.Limit {
 			truncatedByLimit = true
-			break outer
+			break
 		}
-		projects, err := os.ReadDir(filepath.Join(c.FleetRoot, task.Name()))
+		taskName := task.Name()
+		projects, err := os.ReadDir(filepath.Join(c.FleetRoot, taskName))
 		if err != nil {
-			state.Warnings = append(state.Warnings, fmt.Sprintf("task %s unavailable", task.Name()))
+			state.Warnings = append(state.Warnings, fmt.Sprintf("task %s unavailable", taskName))
 			continue
 		}
 		for _, project := range projects {
-			if !project.IsDir() {
-				continue
-			}
 			select {
 			case <-ctx.Done():
 				break outer
 			default:
 			}
+			if !project.IsDir() {
+				continue
+			}
 			if c.Limit > 0 && len(state.Workers) >= c.Limit {
 				truncatedByLimit = true
 				break outer
 			}
-			worker, warnings := c.collectWorker(ctx, filepath.Join(c.FleetRoot, task.Name(), project.Name()), task.Name(), project.Name(), now, staleAfter)
+			worker, warnings := c.collectWorker(ctx, filepath.Join(c.FleetRoot, taskName, project.Name()), taskName, project.Name(), now, staleAfter)
 			state.Workers = append(state.Workers, worker)
 			state.Warnings = append(state.Warnings, warnings...)
 		}
 	}
 	if truncatedByLimit {
-		state.Warnings = append(state.Warnings, fmt.Sprintf("worker scan truncated at configured limit %d; fleet may be partial", c.Limit))
+		state.Warnings = append([]string{fmt.Sprintf("worker scan truncated at configured limit %d; fleet may be partial", c.Limit)}, state.Warnings...)
 	}
 	sort.Slice(state.Workers, func(i, j int) bool {
 		if state.Workers[i].Task == state.Workers[j].Task {

@@ -1415,6 +1415,28 @@ func TestCollectorAddsWarningWhenLimitTruncatesScan(t *testing.T) {
 	}
 }
 
+func TestCollectorPrependsLimitWarningAheadOfWorkerWarnings(t *testing.T) {
+	root := t.TempDir()
+
+	firstWorker := filepath.Join(root, "task-00", "api")
+	mustMkdirAll(t, firstWorker)
+
+	secondWorker := filepath.Join(root, "task-01", "api")
+	mustMkdirAll(t, secondWorker)
+	writeFile(t, filepath.Join(secondWorker, "status"), "in_progress\n")
+
+	state := dashboard.Collector{FleetRoot: root, Limit: 1}.Collect(t.Context())
+	if len(state.Warnings) < 2 {
+		t.Fatalf("warnings = %v, want truncation warning plus worker warning", state.Warnings)
+	}
+	if !strings.Contains(state.Warnings[0], "truncated") {
+		t.Fatalf("warnings[0] = %q, want leading truncation warning so projection cannot drop it", state.Warnings[0])
+	}
+	if !strings.Contains(state.Warnings[1], "invalid status") {
+		t.Fatalf("warnings[1] = %q, want worker warning preserved after truncation warning", state.Warnings[1])
+	}
+}
+
 func TestCollectorLimitGuardFiresBeforeReadingNextTask(t *testing.T) {
 	// Arrange: exactly `limit` projects spread across two separate tasks, each
 	// holding one project.  After the first task fills the limit, the outer
@@ -1444,6 +1466,23 @@ func TestCollectorLimitGuardFiresBeforeReadingNextTask(t *testing.T) {
 		if w.Task == "task-01" {
 			t.Fatalf("worker from task-01 was collected; outer-loop limit guard did not fire before os.ReadDir(task-01)")
 		}
+	}
+}
+
+func TestCollectorLimitUsesDeterministicLexicalTaskOrder(t *testing.T) {
+	root := t.TempDir()
+	for i := 63; i >= 0; i-- {
+		worker := filepath.Join(root, fmt.Sprintf("task-%02d", i), "api")
+		mustMkdirAll(t, worker)
+		writeFile(t, filepath.Join(worker, "status"), "in_progress\n")
+	}
+
+	state := dashboard.Collector{FleetRoot: root, Limit: 1}.Collect(t.Context())
+	if len(state.Workers) != 1 {
+		t.Fatalf("workers = %d, want 1", len(state.Workers))
+	}
+	if state.Workers[0].Task != "task-00" {
+		t.Fatalf("limited worker = %q, want lexical first task task-00", state.Workers[0].Task)
 	}
 }
 
