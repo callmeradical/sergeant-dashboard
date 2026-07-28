@@ -69,7 +69,7 @@ exit 1
 	if err != nil {
 		t.Fatal(err)
 	}
-	wantLog := "--user daemon-reload\n--user enable --now sergeant-dashboard.service\n--user disable --now sergeant-dashboard.service\n--user is-active --quiet sergeant-dashboard.service\n--user daemon-reload\n"
+	wantLog := "--user daemon-reload\n--user enable --now sergeant-dashboard.service\n--user enable --now sergeant-dashboard-tailnet-proxy.service\n--user disable --now sergeant-dashboard-tailnet-proxy.service\n--user disable --now sergeant-dashboard.service\n--user is-active --quiet sergeant-dashboard.service\n--user daemon-reload\n"
 	if string(logData) != wantLog {
 		t.Fatalf("systemctl calls = %q, want %q", logData, wantLog)
 	}
