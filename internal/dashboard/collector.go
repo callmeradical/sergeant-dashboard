@@ -741,6 +741,7 @@ func (c Collector) collectWorker(ctx context.Context, dir, task, project string,
 		return worker, warnings
 	}
 	if worker.Status == "orphaned" {
+		worker.enrichable = false // orphaned workers need no live enrichment
 		return worker, warnings
 	}
 	if isTerminal(worker.Status) {
