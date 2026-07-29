@@ -13,6 +13,11 @@ import (
 	"time"
 )
 
+// stateRequestTimeout is the maximum wall-clock time budget for a single
+// /sergeant/api/state, /sergeant/api/diagnostics, or /sergeant/api/workers
+// request, covering fleet scan, supervisor probing, and filesystem enrichment.
+const stateRequestTimeout = 12 * time.Second
+
 type Source interface {
 	Collect(context.Context) State
 }
@@ -96,7 +101,7 @@ func NewHandler(source Source) http.Handler {
 	}))
 	mux.HandleFunc("/sergeant/api/state", getOnly(func(writer http.ResponseWriter, request *http.Request) {
 		writer.Header().Set("Cache-Control", "no-store")
-		ctx, cancel := context.WithTimeout(request.Context(), maxEnrichmentTime)
+		ctx, cancel := context.WithTimeout(request.Context(), stateRequestTimeout)
 		defer cancel()
 		projected, ok := cache.get(ctx)
 		if !ok || ctx.Err() != nil {
@@ -107,7 +112,7 @@ func NewHandler(source Source) http.Handler {
 	}))
 	mux.HandleFunc("/sergeant/api/diagnostics", getOnly(func(writer http.ResponseWriter, request *http.Request) {
 		writer.Header().Set("Cache-Control", "no-store")
-		ctx, cancel := context.WithTimeout(request.Context(), maxEnrichmentTime)
+		ctx, cancel := context.WithTimeout(request.Context(), stateRequestTimeout)
 		defer cancel()
 		state, ok := sharedSource.Collect(ctx)
 		if !ok || ctx.Err() != nil {
@@ -124,7 +129,7 @@ func NewHandler(source Source) http.Handler {
 			http.NotFound(writer, request)
 			return
 		}
-		ctx, cancel := context.WithTimeout(request.Context(), maxEnrichmentTime)
+		ctx, cancel := context.WithTimeout(request.Context(), stateRequestTimeout)
 		defer cancel()
 		worker, ok := detailSource.CollectDetail(ctx, parts[0], parts[1])
 		if !ok {
@@ -184,7 +189,7 @@ func (source *coalescingSource) Collect(ctx context.Context) (State, bool) {
 	source.mu.Lock()
 	active := source.active
 	if active == nil {
-		collectionCtx, cancel := context.WithTimeout(context.Background(), maxEnrichmentTime)
+		collectionCtx, cancel := context.WithTimeout(context.Background(), stateRequestTimeout)
 		active = &collectionCall{done: make(chan struct{}), cancel: cancel}
 		source.active = active
 		go source.collect(active, collectionCtx)

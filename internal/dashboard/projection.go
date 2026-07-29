@@ -327,23 +327,6 @@ func canonicalGitHubURL(value string) string {
 	return parsed.String()
 }
 
-func repositoryFromRemote(value string) string {
-	if strings.HasPrefix(value, "git@github.com:") {
-		value = strings.TrimPrefix(value, "git@github.com:")
-	} else {
-		parsed, err := url.Parse(value)
-		if err != nil || parsed.Scheme != "https" || parsed.Host != "github.com" || parsed.User != nil || parsed.RawQuery != "" {
-			return ""
-		}
-		value = strings.TrimPrefix(parsed.Path, "/")
-	}
-	value = strings.TrimSuffix(value, ".git")
-	if repositoryName.MatchString(value) {
-		return value
-	}
-	return ""
-}
-
 func RedactText(value string) string {
 	if len(value) > maxOperationalBytes {
 		return "[content unavailable: oversized]"
