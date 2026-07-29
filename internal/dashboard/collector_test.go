@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"runtime"
 	"slices"
 	"strings"
 	"sync"
@@ -17,482 +16,6 @@ import (
 
 	"github.com/callmeradical/sergeant-dashboard/internal/dashboard"
 )
-
-func TestCollectorProbesWorkersConcurrently(t *testing.T) {
-	root := t.TempDir()
-	for _, task := range []string{"task-a", "task-b"} {
-		worker := filepath.Join(root, task, "api")
-		worktree := filepath.Join(root, task+"-worktree")
-		mustMkdirAll(t, worker)
-		mustMkdirAll(t, worktree)
-		writeFile(t, filepath.Join(worker, "status"), "in_progress\n")
-		writeFile(t, filepath.Join(worker, "worktree"), worktree+"\n")
-	}
-	var current atomic.Int32
-	var maximum atomic.Int32
-	release := make(chan struct{})
-	var once sync.Once
-	runner := func(ctx context.Context, _ string, _ string, _ ...string) ([]byte, error) {
-		now := current.Add(1)
-		defer current.Add(-1)
-		for {
-			old := maximum.Load()
-			if now <= old || maximum.CompareAndSwap(old, now) {
-				break
-			}
-		}
-		if now >= 2 {
-			once.Do(func() { close(release) })
-		}
-		select {
-		case <-release:
-			return []byte(`{}`), nil
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		}
-	}
-
-	dashboard.Collector{FleetRoot: root, Run: runner, ProbeTimeout: 100 * time.Millisecond}.Collect(t.Context())
-	if maximum.Load() < 2 {
-		t.Fatalf("maximum concurrent probes = %d, want at least 2", maximum.Load())
-	}
-}
-
-// TestEnrichWorkersBoundsToMaxConcurrentWorkers verifies that a 20-worker fleet
-// still bounds enrichment goroutines to maxConcurrentWorkers.
-// It samples goroutine growth while probes are blocked. With an 8-worker
-// dispatcher, growth should stay at or below 40 goroutines instead of scaling
-// linearly with the fleet size.
-func TestEnrichWorkersBoundsToMaxConcurrentWorkers(t *testing.T) {
-	root := t.TempDir()
-	const workerCount = 20
-	for index := 0; index < workerCount; index++ {
-		worker := filepath.Join(root, fmt.Sprintf("task-%02d", index), "api")
-		worktree := filepath.Join(root, fmt.Sprintf("worktree-%02d", index))
-		mustMkdirAll(t, worker)
-		mustMkdirAll(t, worktree)
-		writeFile(t, filepath.Join(worker, "status"), "in_progress\n")
-		writeFile(t, filepath.Join(worker, "worktree"), worktree+"\n")
-	}
-
-	release := make(chan struct{})
-	ready := make(chan struct{})
-	var active atomic.Int32
-	var once sync.Once
-	runner := func(ctx context.Context, _ string, _ string, _ ...string) ([]byte, error) {
-		if active.Add(1) == 16 { // process-wide slot ceiling reached
-			once.Do(func() { close(ready) })
-		}
-		defer active.Add(-1)
-		select {
-		case <-release:
-			return []byte(`{}`), nil
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		}
-	}
-
-	baseline := runtime.NumGoroutine()
-	done := make(chan struct{})
-	go func() {
-		dashboard.Collector{FleetRoot: root, Run: runner, ProbeTimeout: 5 * time.Second}.Collect(t.Context())
-		close(done)
-	}()
-	select {
-	case <-ready:
-	case <-time.After(2 * time.Second):
-		close(release)
-		t.Fatal("collector did not saturate the process-wide probe limit")
-	}
-
-	// Sample goroutine growth while at peak load.
-	growth := runtime.NumGoroutine() - baseline
-	close(release)
-	select {
-	case <-done:
-	case <-time.After(2 * time.Second):
-		t.Fatal("collector did not finish after release")
-	}
-
-	// With 20 workers bounded to 8 concurrent by the semaphore, goroutine growth
-	// stays capped at 40 instead of tracking the full fleet size.
-	const maxGrowth = 40
-	if growth > maxGrowth {
-		t.Fatalf("goroutine growth = %d with 20 workers, want <= %d (semaphore pool must limit to 8 concurrent)", growth, maxGrowth)
-	}
-	if got := active.Load(); got != 0 {
-		t.Fatalf("active probes after collection = %d, want 0", got)
-	}
-}
-
-func TestCollectorsShareProcessWideProbeLimit(t *testing.T) {
-	root := t.TempDir()
-	for index := 0; index < 8; index++ {
-		worker := filepath.Join(root, fmt.Sprintf("task-%02d", index), "api")
-		worktree := filepath.Join(root, fmt.Sprintf("worktree-%02d", index))
-		mustMkdirAll(t, worker)
-		mustMkdirAll(t, worktree)
-		writeFile(t, filepath.Join(worker, "status"), "in_progress\n")
-		writeFile(t, filepath.Join(worker, "worktree"), worktree+"\n")
-	}
-
-	var active atomic.Int32
-	var maximum atomic.Int32
-	ready := make(chan struct{})
-	release := make(chan struct{})
-	var once sync.Once
-	runner := func(ctx context.Context, _ string, _ string, _ ...string) ([]byte, error) {
-		now := active.Add(1)
-		defer active.Add(-1)
-		for {
-			old := maximum.Load()
-			if now <= old || maximum.CompareAndSwap(old, now) {
-				break
-			}
-		}
-		if now == 16 {
-			once.Do(func() { close(ready) })
-		}
-		select {
-		case <-release:
-			return []byte(`{}`), nil
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		}
-	}
-
-	var collections sync.WaitGroup
-	collections.Add(2)
-	for range 2 {
-		go func() {
-			defer collections.Done()
-			dashboard.Collector{FleetRoot: root, Run: runner, ProbeTimeout: time.Second}.Collect(t.Context())
-		}()
-	}
-	select {
-	case <-ready:
-	case <-time.After(time.Second):
-		close(release)
-		t.Fatal("collectors did not reach the process-wide probe limit")
-	}
-	time.Sleep(25 * time.Millisecond)
-	close(release)
-	collections.Wait()
-	if got := maximum.Load(); got > 16 {
-		t.Fatalf("maximum active probes across collectors = %d, want at most 16", got)
-	}
-}
-
-func TestCollectorUsesAnIndependentTimeoutForEachProbe(t *testing.T) {
-	root := t.TempDir()
-	worker := filepath.Join(root, "task-a", "api")
-	worktree := filepath.Join(root, "worktree")
-	mustMkdirAll(t, worker)
-	mustMkdirAll(t, worktree)
-	writeFile(t, filepath.Join(worker, "status"), "in_progress\n")
-	writeFile(t, filepath.Join(worker, "worktree"), worktree+"\n")
-	writeFile(t, filepath.Join(worker, "repository"), "acme/api\n")
-
-	runner := func(ctx context.Context, _ string, name string, _ ...string) ([]byte, error) {
-		if name == "gh" {
-			<-ctx.Done()
-			return nil, ctx.Err()
-		}
-		if err := ctx.Err(); err != nil {
-			return nil, err
-		}
-		return []byte("run detected"), nil
-	}
-
-	state := dashboard.Collector{FleetRoot: root, Run: runner, ProbeTimeout: time.Millisecond}.Collect(t.Context())
-	if !state.Workers[0].NoMistakes.Available {
-		t.Fatal("a timed-out GitHub probe exhausted the no-mistakes probe timeout")
-	}
-}
-
-func TestCollectorBoundsDegradedFleetLatency(t *testing.T) {
-	root := t.TempDir()
-	const workerCount = 41
-	for index := 0; index < workerCount; index++ {
-		worker := filepath.Join(root, fmt.Sprintf("task-%02d", index), "api")
-		worktree := filepath.Join(root, fmt.Sprintf("worktree-%02d", index))
-		mustMkdirAll(t, worker)
-		mustMkdirAll(t, worktree)
-		writeFile(t, filepath.Join(worker, "status"), "in_progress\n")
-		writeFile(t, filepath.Join(worker, "worktree"), worktree+"\n")
-	}
-
-	var active atomic.Int32
-	var startedProbes atomic.Int32
-	runner := func(ctx context.Context, _ string, _ string, _ ...string) ([]byte, error) {
-		startedProbes.Add(1)
-		active.Add(1)
-		defer active.Add(-1)
-		<-ctx.Done()
-		return nil, ctx.Err()
-	}
-
-	probeTimeout := 100 * time.Millisecond
-	started := time.Now()
-	state := dashboard.Collector{FleetRoot: root, Run: runner, ProbeTimeout: probeTimeout}.Collect(t.Context())
-	elapsed := time.Since(started)
-
-	if len(state.Workers) != workerCount {
-		t.Fatalf("workers = %d, want complete %d-worker projection", len(state.Workers), workerCount)
-	}
-	if got, want := startedProbes.Load(), int32(3*workerCount); got != want {
-		t.Fatalf("started probes = %d, want complete enrichment with %d probes", got, want)
-	}
-	if elapsed >= 5*probeTimeout {
-		t.Fatalf("degraded collection took %v, want less than %v", elapsed, 5*probeTimeout)
-	}
-	if got := active.Load(); got != 0 {
-		t.Fatalf("active probes after collection = %d, want 0", got)
-	}
-}
-
-func TestCollectorAllocatesProbeTimeoutOnlyAcrossEnrichableWorkers(t *testing.T) {
-	root := t.TempDir()
-	const invalidWorkerCount = 40
-	for index := 0; index < invalidWorkerCount; index++ {
-		worker := filepath.Join(root, fmt.Sprintf("invalid-%02d", index), "api")
-		mustMkdirAll(t, worker)
-		status := "orphaned"
-		if index%2 == 0 {
-			status = "invalid"
-		}
-		writeFile(t, filepath.Join(worker, "status"), status+"\n")
-		writeFile(t, filepath.Join(worker, "worktree"), filepath.Join(root, fmt.Sprintf("missing-%02d", index))+"\n")
-	}
-	healthyWorker := filepath.Join(root, "healthy", "api")
-	healthyWorktree := filepath.Join(root, "healthy-worktree")
-	mustMkdirAll(t, healthyWorker)
-	mustMkdirAll(t, healthyWorktree)
-	writeFile(t, filepath.Join(healthyWorker, "status"), "in_progress\n")
-	writeFile(t, filepath.Join(healthyWorker, "worktree"), healthyWorktree+"\n")
-
-	var invalidProbes atomic.Int32
-	runner := func(ctx context.Context, dir, name string, _ ...string) ([]byte, error) {
-		if dir != healthyWorktree {
-			invalidProbes.Add(1)
-			return nil, fmt.Errorf("unexpected probe for invalid worktree %q", dir)
-		}
-		select {
-		case <-time.After(160 * time.Millisecond):
-			if name == "no-mistakes" {
-				return []byte("review"), nil
-			}
-			return []byte(`{"url":"https://github.com/acme/api/pull/7","state":"OPEN"}`), nil
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		}
-	}
-
-	state := dashboard.Collector{FleetRoot: root, Run: runner, ProbeTimeout: 200 * time.Millisecond}.Collect(t.Context())
-	if len(state.Workers) != invalidWorkerCount+1 {
-		t.Fatalf("workers = %d, want complete %d-worker projection", len(state.Workers), invalidWorkerCount+1)
-	}
-	var healthy dashboard.Worker
-	for _, worker := range state.Workers {
-		if worker.Task == "healthy" {
-			healthy = worker
-			break
-		}
-	}
-	if healthy.PullRequest.URL == "" || !healthy.NoMistakes.Available {
-		t.Fatalf("healthy worker metadata incomplete: pull request=%#v no-mistakes=%#v", healthy.PullRequest, healthy.NoMistakes)
-	}
-	if got := invalidProbes.Load(); got != 0 {
-		t.Fatalf("probes for non-enrichable workers = %d, want 0", got)
-	}
-}
-
-func TestCollectorBoundsGoroutinesIndependentlyOfFleetSize(t *testing.T) {
-	root := t.TempDir()
-	for index := 0; index < 512; index++ {
-		worker := filepath.Join(root, fmt.Sprintf("task-%03d", index), "api")
-		worktree := filepath.Join(root, fmt.Sprintf("worktree-%03d", index))
-		mustMkdirAll(t, worker)
-		mustMkdirAll(t, worktree)
-		writeFile(t, filepath.Join(worker, "status"), "in_progress\n")
-		writeFile(t, filepath.Join(worker, "worktree"), worktree+"\n")
-	}
-
-	release := make(chan struct{})
-	ready := make(chan struct{})
-	var active atomic.Int32
-	var maximum atomic.Int32
-	var once sync.Once
-	runner := func(ctx context.Context, _ string, _ string, _ ...string) ([]byte, error) {
-		now := active.Add(1)
-		for {
-			old := maximum.Load()
-			if now <= old || maximum.CompareAndSwap(old, now) {
-				break
-			}
-		}
-		if now == 16 {
-			once.Do(func() { close(ready) })
-		}
-		defer active.Add(-1)
-		select {
-		case <-release:
-			return []byte(`{}`), nil
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		}
-	}
-
-	baseline := runtime.NumGoroutine()
-	done := make(chan struct{})
-	go func() {
-		dashboard.Collector{FleetRoot: root, Run: runner, ProbeTimeout: time.Second}.Collect(t.Context())
-		close(done)
-	}()
-	select {
-	case <-ready:
-	case <-time.After(time.Second):
-		close(release)
-		t.Fatal("collector did not reach its active probe limit")
-	}
-
-	maximumGrowth := 0
-	measurement := time.NewTimer(25 * time.Millisecond)
-	ticker := time.NewTicker(time.Millisecond)
-measure:
-	for {
-		select {
-		case <-ticker.C:
-			maximumGrowth = max(maximumGrowth, runtime.NumGoroutine()-baseline)
-		case <-measurement.C:
-			break measure
-		}
-	}
-	ticker.Stop()
-	close(release)
-	select {
-	case <-done:
-	case <-time.After(time.Second):
-		t.Fatal("collector did not release blocked probes")
-	}
-
-	if maximumGrowth > 40 {
-		t.Fatalf("goroutine growth = %d, want at most 40 independently of fleet size", maximumGrowth)
-	}
-	if got := maximum.Load(); got > 16 {
-		t.Fatalf("maximum active probes = %d, want at most 16", got)
-	}
-	if got := active.Load(); got != 0 {
-		t.Fatalf("active probes after collection = %d, want 0", got)
-	}
-}
-
-func TestCollectorCancellationReleasesProbes(t *testing.T) {
-	root := t.TempDir()
-	for index := 0; index < 8; index++ {
-		worker := filepath.Join(root, fmt.Sprintf("task-%02d", index), "api")
-		worktree := filepath.Join(root, fmt.Sprintf("worktree-%02d", index))
-		mustMkdirAll(t, worker)
-		mustMkdirAll(t, worktree)
-		writeFile(t, filepath.Join(worker, "status"), "in_progress\n")
-		writeFile(t, filepath.Join(worker, "worktree"), worktree+"\n")
-	}
-
-	ready := make(chan struct{})
-	var active atomic.Int32
-	var once sync.Once
-	runner := func(ctx context.Context, _ string, _ string, _ ...string) ([]byte, error) {
-		if active.Add(1) == 16 {
-			once.Do(func() { close(ready) })
-		}
-		defer active.Add(-1)
-		<-ctx.Done()
-		return nil, ctx.Err()
-	}
-
-	ctx, cancel := context.WithCancel(t.Context())
-	done := make(chan dashboard.State, 1)
-	go func() {
-		done <- dashboard.Collector{FleetRoot: root, Run: runner, ProbeTimeout: time.Second}.Collect(ctx)
-	}()
-	select {
-	case <-ready:
-	case <-time.After(time.Second):
-		cancel()
-		t.Fatal("collector did not start all probes")
-	}
-	cancel()
-	select {
-	case state := <-done:
-		if len(state.Workers) != 8 {
-			t.Fatalf("workers = %d, want complete 8-worker projection", len(state.Workers))
-		}
-	case <-time.After(time.Second):
-		t.Fatal("collector did not return after cancellation")
-	}
-	if got := active.Load(); got != 0 {
-		t.Fatalf("active probes after cancellation = %d, want 0", got)
-	}
-}
-
-func TestCollectorEnrichesWorkerWithReadOnlyDeliveryMetadata(t *testing.T) {
-	root := t.TempDir()
-	worker := filepath.Join(root, "task-123", "api")
-	worktree := filepath.Join(root, "worktree")
-	mustMkdirAll(t, worker)
-	mustMkdirAll(t, filepath.Join(worktree, "graphify-out"))
-	writeFile(t, filepath.Join(worker, "status"), "in_progress\n")
-	writeFile(t, filepath.Join(worker, "worktree"), worktree+"\n")
-	writeFile(t, filepath.Join(worker, "repository"), "acme/api\n")
-	writeFile(t, filepath.Join(worker, "td_task"), "td-123\n")
-	writeFile(t, filepath.Join(worker, "response_id"), "opaque-secret-id\n")
-	writeFile(t, filepath.Join(worktree, "graphify-out", "GRAPH_REPORT.md"), "# Collector graph\ntoken=graph-secret\n")
-
-	runner := func(_ context.Context, dir, name string, args ...string) ([]byte, error) {
-		if dir != worktree {
-			t.Fatalf("probe dir = %q, want %q", dir, worktree)
-		}
-		switch name {
-		case "gh":
-			return []byte(`{"url":"https://github.com/acme/api/pull/7","state":"OPEN","statusCheckRollup":[{"name":"test","status":"COMPLETED","conclusion":"SUCCESS"},{"context":"legacy-ci","state":"PENDING"}],"comments":[{"author":{"login":"reviewer"},"body":"ship it; password=private","url":"https://github.com/acme/api/pull/7#issuecomment-1"}]}`), nil
-		case "no-mistakes":
-			return []byte("run 42 review running token=unrecognized-secret\n"), nil
-		case "td":
-			return []byte("td-123: Dashboard\nCOMMENT: rollout approved\nAuthorization: Bearer td-secret\n"), nil
-		default:
-			t.Fatalf("unexpected probe: %s %v", name, args)
-			return nil, nil
-		}
-	}
-
-	state := dashboard.Collector{FleetRoot: root, Run: runner}.Collect(t.Context())
-	got := state.Workers[0]
-	if got.PullRequest.URL != "https://github.com/acme/api/pull/7" || got.PullRequest.Checks[0].Conclusion != "SUCCESS" || got.PullRequest.Checks[1].State != "PENDING" {
-		t.Fatalf("pull request = %#v", got.PullRequest)
-	}
-	if got.PullRequest.Checks[1].Context != "legacy-ci" {
-		t.Fatalf("legacy status context = %q, want legacy-ci", got.PullRequest.Checks[1].Context)
-	}
-	if got.Repository != "acme/api" {
-		t.Fatalf("repository = %q, want configured identity", got.Repository)
-	}
-	if !got.NoMistakes.Available || got.NoMistakes.Phase != "review" {
-		t.Fatalf("no-mistakes = %#v", got.NoMistakes)
-	}
-	if !strings.Contains(got.NoMistakes.Summary, "run 42 review running token=[REDACTED]") || !strings.Contains(got.TD.Summary, "COMMENT: rollout approved") || strings.Contains(got.TD.Summary, "td-secret") {
-		t.Fatalf("td/no-mistakes details = %#v / %#v", got.TD, got.NoMistakes)
-	}
-	if len(got.PullRequest.Comments) != 1 || strings.Contains(got.PullRequest.Comments[0].Body, "private") {
-		t.Fatalf("pull request comments = %#v", got.PullRequest.Comments)
-	}
-	if !got.Graphify.Present || !strings.Contains(got.Graphify.Summary, "# Collector graph") || strings.Contains(got.Graphify.Summary, "graph-secret") || !got.OCInject.ResponsePending {
-		t.Fatalf("graphify/oc-inject = %#v / %#v", got.Graphify, got.OCInject)
-	}
-	serialized := mustJSON(t, state)
-	if strings.Contains(serialized, "opaque-secret-id") || strings.Contains(serialized, "unrecognized-secret") {
-		t.Fatal("opaque source data was exposed")
-	}
-}
 
 func TestCollectorBoundsFleetTraversalBeforeReadingWorkerMetadata(t *testing.T) {
 	root := t.TempDir()
@@ -727,9 +250,7 @@ func TestCollectorDoesNotFollowSymlinkedGraphifyDirectory(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	worker, ok := (dashboard.Collector{FleetRoot: root, Run: func(context.Context, string, string, ...string) ([]byte, error) {
-		return nil, errors.New("unavailable")
-	}}).CollectDetail(t.Context(), "task", "repo")
+	worker, ok := (dashboard.Collector{FleetRoot: root}).CollectDetail(t.Context(), "task", "repo")
 	if !ok {
 		t.Fatal("legitimate worker detail was unavailable")
 	}
@@ -799,21 +320,11 @@ func TestCollectorReportsUnavailableCorruptAndOversizedSourcesTruthfully(t *test
 	writeFile(t, filepath.Join(worker, "td_task"), "td-123\n")
 	writeFile(t, filepath.Join(worktree, "graphify-out", "GRAPH_REPORT.md"), strings.Repeat("x", (64<<10)+1))
 
-	runner := func(_ context.Context, _ string, name string, _ ...string) ([]byte, error) {
-		switch name {
-		case "gh":
-			return []byte(`{"url":`), nil
-		case "no-mistakes":
-			return []byte(strings.Repeat("x", (64<<10)+1)), nil
-		case "td":
-			return []byte(" \n"), nil
-		default:
-			return nil, fmt.Errorf("unexpected probe %s", name)
-		}
-	}
-
-	got := dashboard.Collector{FleetRoot: root, Run: runner}.Collect(t.Context()).Workers[0]
-	if got.PullRequest.Status != "corrupt" || got.NoMistakes.Status != "oversized" || got.TD.Status != "corrupt" || got.TD.Summary != "[content unavailable: corrupt]" || got.Graphify.Status != "oversized" {
+	// The dashboard is filesystem-only: gh, no-mistakes, and td are not called.
+	// PullRequest, NoMistakes, and TD are always reported as unavailable.
+	// Graphify reads from the worktree filesystem and reflects the oversized report.
+	got := dashboard.Collector{FleetRoot: root}.Collect(t.Context()).Workers[0]
+	if got.PullRequest.Status != "unavailable" || got.NoMistakes.Status != "unavailable" || got.TD.Status != "unavailable" || got.Graphify.Status != "oversized" {
 		t.Fatalf("degraded statuses = PR %q, no-mistakes %q, td %q, Graphify %q", got.PullRequest.Status, got.NoMistakes.Status, got.TD.Status, got.Graphify.Status)
 	}
 }
@@ -846,14 +357,7 @@ func TestCollectorPreservesOCInjectMetadataForNonEnrichableWorkers(t *testing.T)
 		setModTime(t, filepath.Join(worker, "response_ack"), now)
 	}
 
-	var probes atomic.Int32
-	state := dashboard.Collector{
-		FleetRoot: root,
-		Run: func(context.Context, string, string, ...string) ([]byte, error) {
-			probes.Add(1)
-			return nil, nil
-		},
-	}.Collect(t.Context())
+	state := dashboard.Collector{FleetRoot: root}.Collect(t.Context())
 
 	byTask := make(map[string]dashboard.Worker, len(state.Workers))
 	for _, worker := range state.Workers {
@@ -872,9 +376,6 @@ func TestCollectorPreservesOCInjectMetadataForNonEnrichableWorkers(t *testing.T)
 			!got.OCInject.ResponseAckedAt.Equal(now) || !got.OCInject.UpdatedAt.Equal(now) {
 			t.Errorf("%s oc-inject metadata = %#v", test.name, got.OCInject)
 		}
-	}
-	if got := probes.Load(); got != 0 {
-		t.Fatalf("probes for non-enrichable workers = %d, want 0", got)
 	}
 	serialized := mustJSON(t, state)
 	if strings.Contains(serialized, "private-response-id") || strings.Contains(serialized, "private-response-ack") {
@@ -1175,27 +676,6 @@ func TestCollectorMatchesSupervisorCommandToExactFleetState(t *testing.T) {
 	}
 }
 
-func TestCollectorReportsSummaryProbeFailures(t *testing.T) {
-	root := t.TempDir()
-	worker := filepath.Join(root, "task", "api")
-	worktree := filepath.Join(root, "worktree")
-	mustMkdirAll(t, worker)
-	mustMkdirAll(t, worktree)
-	writeFile(t, filepath.Join(worker, "status"), "in_progress\n")
-	writeFile(t, filepath.Join(worker, "worktree"), worktree+"\n")
-	writeFile(t, filepath.Join(worker, "pane"), "pane\n")
-	state := dashboard.Collector{
-		FleetRoot: root,
-		Run: func(context.Context, string, string, ...string) ([]byte, error) {
-			return nil, errors.New("probe unavailable")
-		},
-		InspectSupervisor: func(context.Context, string, string) (bool, error) { return true, nil },
-	}.CollectSummary(t.Context())
-	if !slices.Contains(state.Warnings, "worker task/api summary probe failed") {
-		t.Fatalf("warnings = %q, want summary probe failure", state.Warnings)
-	}
-}
-
 func TestCollectorClassifiesTerminalWorkersCompleteAfterWorktreeCleanup(t *testing.T) {
 	root := t.TempDir()
 	tests := []struct {
@@ -1215,14 +695,7 @@ func TestCollectorClassifiesTerminalWorkersCompleteAfterWorktreeCleanup(t *testi
 		writeFile(t, filepath.Join(worker, "worktree"), filepath.Join(root, "removed-"+test.name)+"\n")
 	}
 
-	var probes atomic.Int32
-	state := dashboard.Collector{
-		FleetRoot: root,
-		Run: func(context.Context, string, string, ...string) ([]byte, error) {
-			probes.Add(1)
-			return nil, nil
-		},
-	}.Collect(t.Context())
+	state := dashboard.Collector{FleetRoot: root}.Collect(t.Context())
 
 	byTask := make(map[string]dashboard.Worker, len(state.Workers))
 	for _, worker := range state.Workers {
@@ -1232,9 +705,6 @@ func TestCollectorClassifiesTerminalWorkersCompleteAfterWorktreeCleanup(t *testi
 		if got := byTask[test.name].Health; got != test.wantHealth {
 			t.Errorf("%s health = %q, want %q", test.name, got, test.wantHealth)
 		}
-	}
-	if got := probes.Load(); got != 0 {
-		t.Fatalf("probes for missing worktrees = %d, want 0", got)
 	}
 }
 
@@ -1275,7 +745,6 @@ func TestCollectorClassifiesLifecycleValues(t *testing.T) {
 		FleetRoot:  root,
 		Now:        func() time.Time { return now },
 		StaleAfter: 15 * time.Minute,
-		Run:        func(context.Context, string, string, ...string) ([]byte, error) { return nil, nil },
 	}.Collect(t.Context())
 	byTask := make(map[string]dashboard.Worker, len(state.Workers))
 	for _, worker := range state.Workers {
@@ -1334,7 +803,6 @@ func TestCollectorClassifiesBlockedAndNeedsInputWithoutSupervisorAsActive(t *tes
 		FleetRoot:  root,
 		Now:        func() time.Time { return now },
 		StaleAfter: 15 * time.Minute,
-		Run:        func(context.Context, string, string, ...string) ([]byte, error) { return nil, nil },
 	}.Collect(t.Context())
 	byTask := make(map[string]dashboard.Worker, len(state.Workers))
 	for _, worker := range state.Workers {
@@ -1516,10 +984,7 @@ func TestCollectorClassifiesTerminalRecordsWithAndWithoutWorktree(t *testing.T) 
 		}
 	}
 
-	state := dashboard.Collector{
-		FleetRoot: root,
-		Run:       func(context.Context, string, string, ...string) ([]byte, error) { return nil, nil },
-	}.Collect(t.Context())
+	state := dashboard.Collector{FleetRoot: root}.Collect(t.Context())
 	byTask := make(map[string]dashboard.Worker, len(state.Workers))
 	for _, worker := range state.Workers {
 		byTask[worker.Task] = worker
@@ -1578,7 +1043,6 @@ func TestCollectorUsesMultiFileEvidenceForStaleness(t *testing.T) {
 		FleetRoot:  root,
 		Now:        func() time.Time { return now },
 		StaleAfter: 15 * time.Minute,
-		Run:        func(context.Context, string, string, ...string) ([]byte, error) { return nil, nil },
 	}.Collect(t.Context())
 	byTask := make(map[string]dashboard.Worker, len(state.Workers))
 	for _, worker := range state.Workers {
@@ -1740,38 +1204,6 @@ func TestCollectorDoesNotCascadeSupervisorDeadlineAcrossBatches(t *testing.T) {
 	}
 }
 
-func TestCollectorHonorsConfiguredEnrichmentProbeTimeout(t *testing.T) {
-	root := t.TempDir()
-	worker := filepath.Join(root, "task-a", "api")
-	worktree := filepath.Join(root, "worktree")
-	mustMkdirAll(t, worker)
-	mustMkdirAll(t, worktree)
-	writeFile(t, filepath.Join(worker, "status"), "in_progress\n")
-	writeFile(t, filepath.Join(worker, "worktree"), worktree+"\n")
-	writeFile(t, filepath.Join(worker, "repository"), "acme/api\n")
-
-	runner := func(ctx context.Context, _ string, name string, _ ...string) ([]byte, error) {
-		select {
-		case <-time.After(2500 * time.Millisecond):
-			if name == "gh" {
-				return []byte(`{"url":"https://github.com/acme/api/pull/7","state":"OPEN","statusCheckRollup":[],"comments":[]}`), nil
-			}
-			return []byte("review passed"), nil
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		}
-	}
-
-	state := dashboard.Collector{FleetRoot: root, Run: runner, ProbeTimeout: 3 * time.Second}.Collect(t.Context())
-	workerState := state.Workers[0]
-	if workerState.PullRequest.URL == "" {
-		t.Fatalf("pull request probe ignored configured timeout: %#v", workerState.PullRequest)
-	}
-	if !workerState.NoMistakes.Available {
-		t.Fatalf("no-mistakes probe ignored configured timeout: %#v", workerState.NoMistakes)
-	}
-}
-
 // Regression tests for td-9782c5: Collector.Collect must apply limit before
 // materializing the full fleet and must check ctx during the scan walk.
 
@@ -1787,27 +1219,14 @@ func TestCollectorAppliesLimitBeforeEnrichment(t *testing.T) {
 		writeFile(t, filepath.Join(worker, "worktree"), worktree+"\n")
 	}
 
-	var enriched atomic.Int32
-	runner := func(_ context.Context, _ string, _ string, _ ...string) ([]byte, error) {
-		enriched.Add(1)
-		return []byte(`{}`), nil
-	}
-
 	const limit = 3
 	state := dashboard.Collector{
 		FleetRoot: root,
-		Run:       runner,
 		Limit:     limit,
 	}.Collect(t.Context())
 
 	if len(state.Workers) != limit {
 		t.Fatalf("workers = %d, want limit %d applied before enrichment", len(state.Workers), limit)
-	}
-	// Each enrichable worker triggers 3 probes (gh, no-mistakes, git-remote); with a
-	// limit of 3, at most limit*3 probes should execute, not totalWorkers*3.
-	const probesPerWorker = 3
-	if got := enriched.Load(); got > int32(limit*probesPerWorker) {
-		t.Fatalf("enrichment probes = %d, want at most %d (limit %d * %d probes/worker); limit must apply before enrichment", got, limit*probesPerWorker, limit, probesPerWorker)
 	}
 }
 
@@ -1890,36 +1309,6 @@ func TestCollectorLimitGuardFiresBeforeReadingNextTask(t *testing.T) {
 
 // Regression test for td-bd77c2: Check must preserve statusCheckRollup.context
 // so legacy GitHub status checks retain their identifier.
-
-func TestCollectorPreservesLegacyStatusContextName(t *testing.T) {
-	root := t.TempDir()
-	worker := filepath.Join(root, "task-a", "api")
-	worktree := filepath.Join(root, "worktree")
-	mustMkdirAll(t, worker)
-	mustMkdirAll(t, worktree)
-	writeFile(t, filepath.Join(worker, "status"), "in_progress\n")
-	writeFile(t, filepath.Join(worker, "worktree"), worktree+"\n")
-	writeFile(t, filepath.Join(worker, "repository"), "acme/api\n")
-
-	runner := func(_ context.Context, _ string, name string, _ ...string) ([]byte, error) {
-		if name == "gh" {
-			return []byte(`{"url":"https://github.com/acme/api/pull/1","state":"OPEN","statusCheckRollup":[{"context":"legacy-ci","state":"PENDING","description":"Tests running"}],"comments":[]}`), nil
-		}
-		return []byte(`{}`), nil
-	}
-
-	state := dashboard.Collector{FleetRoot: root, Run: runner}.Collect(t.Context())
-	if len(state.Workers) == 0 {
-		t.Fatal("no workers collected")
-	}
-	checks := state.Workers[0].PullRequest.Checks
-	if len(checks) != 1 {
-		t.Fatalf("checks = %d, want 1", len(checks))
-	}
-	if checks[0].Context != "legacy-ci" {
-		t.Fatalf("legacy check context = %q, want %q; legacy status checks must retain their context identifier", checks[0].Context, "legacy-ci")
-	}
-}
 
 func mustMkdirAll(t *testing.T, path string) {
 	t.Helper()

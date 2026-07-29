@@ -12,7 +12,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -112,7 +111,7 @@ func TestDetailAPIReturnsServiceUnavailableWhenCollectionIsCanceled(t *testing.T
 	}
 }
 
-func TestStateAPIDoesNotRunDetailProbesAcrossRequests(t *testing.T) {
+func TestStateAPIDeduplicatesConcurrentSummaryRequests(t *testing.T) {
 	root := t.TempDir()
 	for index := 0; index < 8; index++ {
 		worker := filepath.Join(root, fmt.Sprintf("task-%02d", index), "api")
@@ -124,36 +123,8 @@ func TestStateAPIDoesNotRunDetailProbesAcrossRequests(t *testing.T) {
 		writeFile(t, filepath.Join(worker, "worktree"), worktree+"\n")
 	}
 
-	var active atomic.Int32
-	var maximum atomic.Int32
-	var total atomic.Int32
-	var detailProbes atomic.Int32
-	runner := func(ctx context.Context, _ string, name string, args ...string) ([]byte, error) {
-		total.Add(1)
-		if name != "gh" || !slices.Equal(args, []string{"pr", "view", "--json", "state"}) {
-			detailProbes.Add(1)
-		}
-		now := active.Add(1)
-		defer active.Add(-1)
-		for {
-			old := maximum.Load()
-			if now <= old || maximum.CompareAndSwap(old, now) {
-				break
-			}
-		}
-		select {
-		case <-time.After(100 * time.Millisecond):
-			if name == "no-mistakes" {
-				return []byte("review"), nil
-			}
-			return []byte(`{"url":"https://github.com/acme/api/pull/7","state":"OPEN"}`), nil
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		}
-	}
-
 	handler := dashboard.NewHandler(dashboard.Collector{
-		FleetRoot: root, Run: runner, ProbeTimeout: 150 * time.Millisecond,
+		FleetRoot:         root,
 		InspectSupervisor: func(context.Context, string, string) (bool, error) { return true, nil },
 	})
 	var requests sync.WaitGroup
@@ -168,15 +139,6 @@ func TestStateAPIDoesNotRunDetailProbesAcrossRequests(t *testing.T) {
 	requests.Wait()
 	close(responses)
 
-	if got := maximum.Load(); got > 16 {
-		t.Fatalf("maximum active probes across requests = %d, want at most 16", got)
-	}
-	if got := total.Load(); got != 8 {
-		t.Fatalf("summary probes across overlapping requests = %d, want one shared 8-worker collection", got)
-	}
-	if got := detailProbes.Load(); got != 0 {
-		t.Fatalf("detail probes across summary requests = %d, want 0", got)
-	}
 	for response := range responses {
 		body := response.Body.String()
 		if got := strings.Count(body, `"health":"active"`); got != 8 {
@@ -349,36 +311,17 @@ func TestStateSummaryDoesNotPreloadWorkerDetail(t *testing.T) {
 	writeFile(t, filepath.Join(worker, "worktree"), worktree+"\n")
 	writeFile(t, filepath.Join(worker, "message"), "approval needed token=private-secret\n")
 
-	var probes atomic.Int32
-	var detailProbes atomic.Int32
-	runner := func(_ context.Context, _ string, name string, args ...string) ([]byte, error) {
-		probes.Add(1)
-		if name != "gh" || !slices.Equal(args, []string{"pr", "view", "--json", "state"}) {
-			detailProbes.Add(1)
-		}
-		switch name {
-		case "gh":
-			return []byte(`{"url":"https://github.com/acme/api/pull/7","state":"OPEN","statusCheckRollup":[{"context":"legacy-ci","state":"SUCCESS"}]}`), nil
-		case "no-mistakes":
-			return []byte("review passed"), nil
-		default:
-			return nil, fmt.Errorf("unexpected probe %s", name)
-		}
-	}
-	handler := dashboard.NewHandler(dashboard.Collector{FleetRoot: root, ConfigRoot: configRoot, Run: runner})
+	// The dashboard is filesystem-only; no external subprocess probes are run.
+	handler := dashboard.NewHandler(dashboard.Collector{FleetRoot: root, ConfigRoot: configRoot})
 
 	summary := request(t, handler, http.MethodGet, "/sergeant/api/state")
-	if got := probes.Load(); got != 1 {
-		t.Fatalf("summary request executed %d summary probes, want 1", got)
-	}
-	if got := detailProbes.Load(); got != 0 {
-		t.Fatalf("summary request executed %d detail probes", got)
-	}
-	for _, expected := range []string{`"project":"operator-suite"`, `"repository":"api"`, `"title":"Repair production API"`, `"pullRequestState":"OPEN"`} {
+	// Config-resolved identity is still projected in the summary.
+	for _, expected := range []string{`"project":"operator-suite"`, `"repository":"api"`, `"title":"Repair production API"`} {
 		if !strings.Contains(summary.Body.String(), expected) {
 			t.Errorf("summary omitted %s: %s", expected, summary.Body.String())
 		}
 	}
+	// Detail fields must not bleed into the summary response.
 	for _, forbidden := range []string{"feat/private-branch", "approval needed", "private-secret", `"checks"`, `"message"`, `"worktree"`} {
 		if strings.Contains(summary.Body.String(), forbidden) {
 			t.Errorf("summary preloaded detail %q: %s", forbidden, summary.Body.String())
@@ -389,13 +332,11 @@ func TestStateSummaryDoesNotPreloadWorkerDetail(t *testing.T) {
 	if detail.Code != http.StatusOK {
 		t.Fatalf("detail response = %d %s", detail.Code, detail.Body.String())
 	}
-	for _, expected := range []string{"feat/private-branch", "approval needed token=[REDACTED]", `"context":"legacy-ci"`} {
+	// Filesystem-sourced detail fields are still present.
+	for _, expected := range []string{"feat/private-branch", "approval needed token=[REDACTED]"} {
 		if !strings.Contains(detail.Body.String(), expected) {
 			t.Errorf("detail omitted %q: %s", expected, detail.Body.String())
 		}
-	}
-	if got := probes.Load(); got == 0 {
-		t.Fatal("detail request did not execute on-demand probes")
 	}
 }
 

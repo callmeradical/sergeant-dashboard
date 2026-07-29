@@ -3,7 +3,6 @@ package dashboard
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -21,27 +20,20 @@ const (
 	maxScalarBytes         = 4096
 	maxOperationalBytes    = 64 << 10
 	maxConcurrentWorkers   = 8
-	maxEnrichmentBatches   = 4
-	maxEnrichmentTime      = 12 * time.Second
 	supervisorProbeTimeout = 2 * time.Second
 )
-
-var processProbeSlots = make(chan struct{}, 2*maxConcurrentWorkers)
 
 type Collector struct {
 	FleetRoot         string
 	ConfigRoot        string
 	StaleAfter        time.Duration
 	Now               func() time.Time
-	Run               Runner
 	ProbeTimeout      time.Duration
 	InspectSupervisor SupervisorInspector
 	// Limit caps the number of workers materialised during the fleet scan.
 	// Zero or negative means no limit.
 	Limit int
 }
-
-type Runner func(ctx context.Context, dir, name string, args ...string) ([]byte, error)
 
 // SupervisorInspector verifies whether a tmux pane is running the expected
 // sgt-worker process for the given fleet state directory.
@@ -76,7 +68,6 @@ type Worker struct {
 	OCInject       AuditMetadata `json:"ocInject"`
 	enrichable     bool
 	fleetProject   string
-	summaryError   string
 	supervisorPane string
 	stateDir       string
 }
@@ -127,14 +118,14 @@ type AuditMetadata struct {
 }
 
 func (c Collector) Collect(ctx context.Context) State {
-	return c.collect(ctx, true)
+	return c.collect(ctx)
 }
 
 func (c Collector) CollectSummary(ctx context.Context) State {
-	return c.collect(ctx, false)
+	return c.collect(ctx)
 }
 
-func (c Collector) collect(ctx context.Context, detail bool) State {
+func (c Collector) collect(ctx context.Context) State {
 	now := time.Now().UTC()
 	if c.Now != nil {
 		now = c.Now().UTC()
@@ -213,16 +204,7 @@ outer:
 		return state.Workers[i].Task < state.Workers[j].Task
 	})
 	c.inspectWorkers(ctx, now, staleAfter, state.Workers)
-	if detail {
-		c.enrichWorkers(ctx, state.Workers)
-	} else {
-		c.enrichSummaryWorkers(ctx, state.Workers)
-		for _, worker := range state.Workers {
-			if worker.summaryError != "" {
-				state.Warnings = append(state.Warnings, worker.summaryError)
-			}
-		}
-	}
+	c.enrichWorkers(ctx, state.Workers)
 	return state
 }
 
@@ -280,7 +262,7 @@ func (c Collector) CollectDetail(ctx context.Context, task, repository string) (
 			worker.Health = ageHealth(activityAt, now, staleAfter)
 		}
 	}
-	c.enrichWorker(ctx, &worker)
+	c.enrichWorker(&worker)
 	return worker, ctx.Err() == nil
 }
 
@@ -345,38 +327,12 @@ func (c Collector) inspectWorkers(ctx context.Context, now time.Time, staleAfter
 	wait.Wait()
 }
 
+// enrichWorkers applies filesystem-based enrichment to each worker concurrently.
+// Enrichment reads from the local worktree only; no external subprocess calls
+// are made. The semaphore bounds concurrent goroutines to maxConcurrentWorkers
+// to prevent unbounded goroutine growth for large fleets; filesystem reads can
+// still block on slow or network-mounted worktrees, so the bound is retained.
 func (c Collector) enrichWorkers(ctx context.Context, workers []Worker) {
-	probeTimeout := c.ProbeTimeout
-	if probeTimeout <= 0 {
-		probeTimeout = 3 * time.Second
-	}
-	enrichmentTime := maxEnrichmentTime
-	if probeTimeout <= maxEnrichmentTime/maxEnrichmentBatches {
-		enrichmentTime = maxEnrichmentBatches * probeTimeout
-	}
-	probeCount := 0
-	for index := range workers {
-		if workers[index].enrichable {
-			probeCount += 2
-			if workers[index].Repository == "" {
-				probeCount++
-			}
-			if tdTaskID.MatchString(workers[index].TDTask) {
-				probeCount++
-			}
-		}
-	}
-	batchCount := (probeCount + cap(processProbeSlots) - 1) / cap(processProbeSlots)
-	if batchCount > 0 {
-		probeTimeout = min(probeTimeout, enrichmentTime/time.Duration(batchCount))
-	}
-	probeCollector := c
-	probeCollector.ProbeTimeout = probeTimeout
-
-	// Semaphore of size maxConcurrentWorkers: the dispatcher acquires one slot
-	// before launching each goroutine and the goroutine releases it on return.
-	// This bounds concurrent goroutines to maxConcurrentWorkers (not fleet size),
-	// fixing both td-ab7c04 and td-577246.
 	sem := make(chan struct{}, maxConcurrentWorkers)
 	var wg sync.WaitGroup
 dispatch:
@@ -391,84 +347,24 @@ dispatch:
 		go func() {
 			defer wg.Done()
 			defer func() { <-sem }()
-			probeCollector.enrichWorker(ctx, w)
+			c.enrichWorker(w)
 		}()
 	}
 	wg.Wait()
 }
 
-func (c Collector) enrichSummaryWorkers(ctx context.Context, workers []Worker) {
-	enrichable := 0
-	for index := range workers {
-		if workers[index].enrichable {
-			enrichable++
-		}
+// enrichWorker populates filesystem-derived fields for a single worker.
+// It reads OCInject transport metadata and Graphify report presence from the
+// local filesystem only. PullRequest, NoMistakes, and TD are set to
+// "unavailable" because their upstream sources (gh, no-mistakes, td) are
+// external subprocesses that the dashboard no longer invokes.
+func (c Collector) enrichWorker(worker *Worker) {
+	worker.PullRequest = PullRequest{Checks: []Check{}, Comments: []Comment{}, Status: "unavailable"}
+	worker.NoMistakes = ToolStatus{Status: "unavailable"}
+	if worker.TDTask != "" {
+		worker.TD = FileMetadata{Present: true, Summary: "[content unavailable: unavailable]", Status: "unavailable"}
 	}
-	if enrichable == 0 {
-		return
-	}
-	timeout := c.ProbeTimeout
-	if timeout <= 0 {
-		timeout = 3 * time.Second
-	}
-	batches := (enrichable + maxConcurrentWorkers - 1) / maxConcurrentWorkers
-	enrichmentTime := min(time.Duration(batches)*timeout, maxEnrichmentTime)
-	probeCtx, cancel := context.WithTimeout(ctx, enrichmentTime)
-	defer cancel()
-	jobs := make(chan *Worker)
-	workerCount := min(enrichable, maxConcurrentWorkers)
-	var wait sync.WaitGroup
-	wait.Add(workerCount)
-	for range workerCount {
-		go func() {
-			defer wait.Done()
-			for worker := range jobs {
-				c.enrichSummaryWorker(probeCtx, worker, timeout)
-			}
-		}()
-	}
-	for index := range workers {
-		if !workers[index].enrichable {
-			continue
-		}
-		select {
-		case jobs <- &workers[index]:
-		case <-probeCtx.Done():
-			close(jobs)
-			wait.Wait()
-			return
-		}
-	}
-	close(jobs)
-	wait.Wait()
-}
-
-func (c Collector) enrichSummaryWorker(ctx context.Context, worker *Worker, timeout time.Duration) {
-	run := c.Run
-	if run == nil {
-		run = runCommand
-	}
-	output, err := runLimitedProbe(ctx, timeout, run, worker.Worktree, "gh", "pr", "view", "--json", "state")
-	if err != nil {
-		worker.summaryError = fmt.Sprintf("worker %s/%s summary probe failed", worker.Task, worker.fleetProject)
-		return
-	}
-	if len(output) > maxScalarBytes {
-		worker.summaryError = fmt.Sprintf("worker %s/%s summary probe failed: oversized response", worker.Task, worker.fleetProject)
-		return
-	}
-	var response struct {
-		State string `json:"state"`
-	}
-	if json.Unmarshal(output, &response) != nil {
-		worker.summaryError = fmt.Sprintf("worker %s/%s summary probe failed: corrupt response", worker.Task, worker.fleetProject)
-		return
-	}
-	worker.PullRequest.State = RedactText(response.State)
-}
-
-func (c Collector) enrichWorker(parent context.Context, worker *Worker) {
-	worker.PullRequest.Checks = []Check{}
+	// OCInject transport metadata is always read from the filesystem.
 	pending := FileMetadata{}
 	if worker.Worktree != "" {
 		pending = fileMetadata(filepath.Join(filepath.Dir(worker.Worktree), "response_id"))
@@ -487,114 +383,10 @@ func (c Collector) enrichWorker(parent context.Context, worker *Worker) {
 		UpdatedAt:         latestTime(pending.UpdatedAt, acked.UpdatedAt),
 	}
 	if !worker.enrichable {
-		worker.PullRequest.Status = "unavailable"
-		worker.NoMistakes.Status = "unavailable"
-		worker.Graphify.Status = "missing"
-		if worker.TDTask != "" {
-			worker.TD = FileMetadata{Present: true, Summary: "[content unavailable: unavailable]", Status: "unavailable"}
-		}
+		worker.Graphify = FileMetadata{Status: "missing"}
 		return
 	}
 	worker.Graphify = graphifyMetadata(worker.Worktree)
-
-	run := c.Run
-	if run == nil {
-		run = runCommand
-	}
-	timeout := c.ProbeTimeout
-	if timeout <= 0 {
-		timeout = 3 * time.Second
-	}
-	pullRequest := make(chan PullRequest, 1)
-	go func() {
-		result := PullRequest{Checks: []Check{}, Comments: []Comment{}, Status: "unavailable"}
-		output, err := runLimitedProbe(parent, timeout, run, worker.Worktree, "gh", "pr", "view", "--json", "url,state,statusCheckRollup,comments")
-		if err == nil && len(output) > 1<<20 {
-			result.Status = "oversized"
-		} else if err == nil {
-			var response struct {
-				URL               string  `json:"url"`
-				State             string  `json:"state"`
-				StatusCheckRollup []Check `json:"statusCheckRollup"`
-				Comments          []struct {
-					Author struct {
-						Login string `json:"login"`
-					} `json:"author"`
-					Body      string    `json:"body"`
-					URL       string    `json:"url"`
-					CreatedAt time.Time `json:"createdAt"`
-				} `json:"comments"`
-			}
-			if json.Unmarshal(output, &response) == nil {
-				if response.StatusCheckRollup == nil {
-					response.StatusCheckRollup = []Check{}
-				}
-				comments := make([]Comment, 0, len(response.Comments))
-				for _, comment := range response.Comments {
-					comments = append(comments, Comment{Author: RedactText(comment.Author.Login), Body: RedactText(comment.Body), URL: RedactText(comment.URL), CreatedAt: comment.CreatedAt})
-				}
-				result = PullRequest{URL: response.URL, State: response.State, Checks: response.StatusCheckRollup, Comments: comments, Status: "available"}
-			} else {
-				result.Status = "corrupt"
-			}
-		}
-		pullRequest <- result
-	}()
-	noMistakes := make(chan ToolStatus, 1)
-	go func() {
-		result := ToolStatus{Status: "unavailable"}
-		output, err := runLimitedProbe(parent, timeout, run, worker.Worktree, "no-mistakes", "runs", "--limit", "1")
-		if err == nil && len(output) > maxOperationalBytes {
-			result.Status = "oversized"
-		} else if err == nil {
-			summary := strings.TrimSpace(RedactText(string(output)))
-			if summary == "" {
-				result.Status = "corrupt"
-			} else {
-				result = ToolStatus{Available: true, Phase: noMistakesPhase(output), Summary: summary, Status: "available"}
-			}
-		}
-		noMistakes <- result
-	}()
-	td := make(chan FileMetadata, 1)
-	go func() {
-		if !tdTaskID.MatchString(worker.TDTask) {
-			td <- FileMetadata{}
-			return
-		}
-		output, err := runLimitedProbe(parent, timeout, run, worker.Worktree, "td", "context", worker.TDTask)
-		if err != nil || len(output) > maxOperationalBytes {
-			status := "unavailable"
-			if err == nil {
-				status = "oversized"
-			}
-			td <- FileMetadata{Present: true, Summary: "[content unavailable: " + status + "]", Status: status}
-			return
-		}
-		summary := strings.TrimSpace(RedactText(string(output)))
-		if summary == "" {
-			td <- FileMetadata{Present: true, Summary: "[content unavailable: corrupt]", Status: "corrupt"}
-			return
-		}
-		td <- FileMetadata{Present: true, Summary: summary, Status: "available"}
-	}()
-	repository := make(chan string, 1)
-	go func() {
-		if worker.Repository != "" {
-			repository <- worker.Repository
-			return
-		}
-		output, err := runLimitedProbe(parent, timeout, run, worker.Worktree, "git", "remote", "get-url", "origin")
-		if err != nil || len(output) > maxScalarBytes {
-			repository <- ""
-			return
-		}
-		repository <- repositoryFromRemote(strings.TrimSpace(string(output)))
-	}()
-	worker.PullRequest = <-pullRequest
-	worker.NoMistakes = <-noMistakes
-	worker.TD = <-td
-	worker.Repository = <-repository
 }
 
 type projectConfig struct {
@@ -656,37 +448,10 @@ func (c Collector) configuredIdentity(ctx context.Context, task, repository stri
 	return config.Name, repository, title
 }
 
-func runLimitedProbe(parent context.Context, timeout time.Duration, run Runner, dir, name string, args ...string) ([]byte, error) {
-	select {
-	case processProbeSlots <- struct{}{}:
-		defer func() { <-processProbeSlots }()
-		ctx, cancel := context.WithTimeout(parent, timeout)
-		defer cancel()
-		return run(ctx, dir, name, args...)
-	case <-parent.Done():
-		return nil, parent.Err()
-	}
-}
-
-func noMistakesPhase(output []byte) string {
-	if len(output) > maxScalarBytes {
-		return ""
-	}
-	fields := strings.FieldsFunc(strings.ToLower(string(output)), func(character rune) bool {
-		return character < 'a' || character > 'z'
-	})
-	for _, field := range fields {
-		switch field {
-		case "intent", "rebase", "review", "test", "document", "lint", "push", "pr", "ci":
-			return field
-		}
-	}
-	return ""
-}
-
-func runCommand(ctx context.Context, dir, name string, args ...string) ([]byte, error) {
-	command := exec.CommandContext(ctx, name, args...)
-	command.Dir = dir
+// runTmuxCommand runs a tmux subprocess. It is the only external subprocess
+// the dashboard collector invokes; all other data sources are filesystem-only.
+func runTmuxCommand(ctx context.Context, args ...string) ([]byte, error) {
+	command := exec.CommandContext(ctx, "tmux", args...)
 	output := boundedBuffer{remaining: (1 << 20) + 1}
 	command.Stdout = &output
 	if err := command.Run(); err != nil {
@@ -846,7 +611,7 @@ func ageHealth(activityAt, now time.Time, staleAfter time.Duration) string {
 
 // inspectSupervisor is the real supervisor inspector that queries tmux.
 func inspectSupervisor(ctx context.Context, pane, stateDir string) (bool, error) {
-	output, err := runCommand(ctx, "", "tmux", "display-message", "-p", "-t", pane, "#{pane_dead}|#{pane_start_command}")
+	output, err := runTmuxCommand(ctx, "display-message", "-p", "-t", pane, "#{pane_dead}|#{pane_start_command}")
 	if err != nil {
 		return false, err
 	}
